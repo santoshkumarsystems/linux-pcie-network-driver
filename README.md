@@ -305,12 +305,36 @@ This prevents leaked PCI, MMIO, DMA, IRQ, and kernel resources.
 
 ### PCI / MMIO
 
-- [ ] PCI Vendor / Device ID matching
-- [ ] probe() and remove()
-- [ ] PCI device enablement
-- [ ] BAR discovery and ownership
-- [ ] MMIO mapping
-- [ ] register access
+- [x] PCI Vendor / Device ID matching
+- [x] probe() and remove()
+- [x] PCI device enablement
+- [x] BAR discovery and ownership
+- [x] MMIO mapping
+- [x] register access
+
+## Current Status
+
+PCI/MMIO initialization is implemented and validated against the
+QEMU-emulated Intel 82540EM (`8086:100e`).
+
+Validated functionality:
+
+- custom driver binding
+- PCI probe/remove lifecycle
+- BAR0 discovery and ownership
+- BAR0 MMIO mapping
+- Intel CTRL and STATUS register access
+- clean driver unload and resource release
+
+Observed test environment:
+
+- BAR0 base: `0xfeb00000`
+- BAR0 size: `128 KiB`
+- CTRL: `0x40140240`
+- STATUS: `0x80080783`
+
+The next milestone adds PCI bus mastering, interrupt handling, and DMA
+resources.
 
 ### Interrupts / DMA
 

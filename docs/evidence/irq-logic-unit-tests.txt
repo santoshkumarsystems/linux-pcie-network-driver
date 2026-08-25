@@ -1,0 +1,14 @@
+./build/tests/test_irq_logic
+tests/unit/test_irq_logic.c:186:test_irq_pending_returns_false_for_zero_cause:PASS
+tests/unit/test_irq_logic.c:189:test_irq_pending_returns_true_for_lsc:PASS
+tests/unit/test_irq_logic.c:192:test_irq_pending_returns_true_for_other_cause:PASS
+tests/unit/test_irq_logic.c:195:test_irq_pending_returns_true_for_multiple_causes:PASS
+tests/unit/test_irq_logic.c:198:test_lsc_returns_false_for_zero_cause:PASS
+tests/unit/test_irq_logic.c:201:test_lsc_returns_true_for_exact_lsc_cause:PASS
+tests/unit/test_irq_logic.c:204:test_lsc_returns_false_for_unrelated_cause:PASS
+tests/unit/test_irq_logic.c:207:test_lsc_returns_true_when_multiple_causes_include_lsc:PASS
+tests/unit/test_irq_logic.c:210:test_lsc_returns_true_when_all_bits_are_set:PASS
+
+-----------------------
+9 Tests 0 Failures 0 Ignored
+OK

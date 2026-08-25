@@ -1,0 +1,14 @@
+[ 4372.217462] sk_e1000: matched PCI device 8086:100e
+[ 4372.218151] sk_e1000: PCI bus mastering enabled
+[ 4372.218166] sk_e1000: BAR0 physical start=0xfeb00000
+[ 4372.218167] sk_e1000: BAR0 size=131072 bytes
+[ 4372.218328] sk_e1000: CTRL   = 0x40140240
+[ 4372.218329] sk_e1000: STATUS = 0x80080783
+[ 4372.218330] sk_e1000: PCI/MMIO initialization PASSED
+[ 4372.218536] sk_e1000: IRQ handler registered on IRQ 20
+[ 4372.218556] sk_e1000: triggering LSC interrupt test
+[ 4372.218625] sk_e1000: interrupt received ICR=0x00000004
+[ 4372.218627] sk_e1000: LSC interrupt handled
+[ 4372.218635] sk_e1000: interrupt test PASSED
+[ 4372.218657] sk_e1000: PCI/MMIO/IRQ initialization PASSED
+[ 4372.327869] sk_e1000: device removed and resources released

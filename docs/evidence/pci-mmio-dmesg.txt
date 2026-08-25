@@ -1,0 +1,7 @@
+[ 3542.637099] sk_e1000: matched PCI device 8086:100e
+[ 3542.637547] sk_e1000: BAR0 physical start=0xfeb00000
+[ 3542.637549] sk_e1000: BAR0 size=131072 bytes
+[ 3542.637599] sk_e1000: CTRL   = 0x40140240
+[ 3542.637600] sk_e1000: STATUS = 0x80080783
+[ 3542.637600] sk_e1000: PCI/MMIO initialization PASSED
+[ 3542.661106] sk_e1000: device removed and resources released

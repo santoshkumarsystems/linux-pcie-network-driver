@@ -306,7 +306,7 @@ This prevents leaked PCI, MMIO, DMA, IRQ, and kernel resources.
 ### PCI / MMIO
 
 - [x] PCI Vendor / Device ID matching
-- [x] probe() and remove()
+- [x] `probe()` and `remove()`
 - [x] PCI device enablement
 - [x] BAR discovery and ownership
 - [x] MMIO mapping
@@ -335,6 +335,31 @@ Observed test environment:
 
 The next milestone adds PCI bus mastering, interrupt handling, and DMA
 resources.
+
+## Runtime Evidence
+
+The PCI/MMIO milestone is validated through an automated QEMU integration test.
+
+Automated validation covers:
+
+- Intel 82540EM PCI device detection (`8086:100e`)
+- custom driver module loading
+- driver binding to the target NIC
+- BAR0 discovery
+- CTRL register MMIO access
+- STATUS register MMIO access
+- successful PCI/MMIO initialization
+- clean driver unload
+- PCI device release
+
+Test output:
+
+- [`docs/evidence/pci-mmio-integration.txt`](docs/evidence/pci-mmio-integration.txt)
+- [`docs/evidence/pci-mmio-dmesg.txt`](docs/evidence/pci-mmio-dmesg.txt)
+
+Integration test source:
+
+- [`tests/integration/test_pci_mmio.sh`](tests/integration/test_pci_mmio.sh)
 
 ### Interrupts / DMA
 

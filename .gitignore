@@ -1,0 +1,73 @@
+# ==============================
+# Linux kernel build artifacts
+# ==============================
+
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+
+Module.symvers
+modules.order
+
+.tmp_versions/
+.*.cmd
+
+
+# ==============================
+# User-space build artifacts
+# ==============================
+
+build/
+bin/
+*.out
+
+
+# ==============================
+# QEMU / virtual machine files
+# ==============================
+
+*.qcow2
+*.img
+*.iso
+
+
+# ==============================
+# Logs / runtime output
+# ==============================
+
+*.log
+*.trace
+
+
+# ==============================
+# Editor / IDE files
+# ==============================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+
+# ==============================
+# Private local files
+# ==============================
+
+PRIVATE_NOTES*
+.env
+.env.*
+secrets/
+
+
+# ==============================
+# Temporary files
+# ==============================
+
+*.tmp
+*.bak
+.DS_Store

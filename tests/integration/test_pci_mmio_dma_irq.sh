@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# test_pci_mmio_irq.sh
+# test_pci_mmio_dma_irq.sh
 #
-# Integration validation for the sk_e1000 Linux PCIe network driver.
+# Integration validation for the sk_e1000 Linux network driver.
 #
 # Hardware target:
 #   QEMU-emulated Intel 82540EM
@@ -13,16 +13,19 @@
 #
 #   - PCI device discovery
 #   - PCI Vendor / Device identity
-#   - driver binding
+#   - custom driver binding
 #   - BAR0 discovery
 #   - MMIO register access
 #   - PCI bus mastering
+#   - DMA addressing configuration
+#   - coherent DMA memory allocation
+#   - DMA address creation
 #   - legacy INTx interrupt registration
 #   - e1000 interrupt generation through ICS
 #   - interrupt delivery through Linux
 #   - ICR cause handling
 #   - Link Status Change interrupt handling
-#   - ordered module teardown
+#   - coherent DMA release
 #   - IRQ release
 #   - PCI bus-master cleanup
 #   - PCI device release
@@ -47,6 +50,8 @@ EXPECTED_DEVICE="0x100e"
 
 DRIVER_NAME="sk_e1000"
 STOCK_DRIVER="e1000"
+
+EXPECTED_DMA_SIZE="4096"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -126,12 +131,6 @@ restore_original_driver()
 # -----------------------------------------------------------------------------
 # Failure / exit cleanup
 # -----------------------------------------------------------------------------
-#
-# The test must not leave sk_e1000 loaded when an assertion fails.
-#
-# If the stock e1000 driver owned the NIC before the test, restore that
-# ownership when the test exits.
-#
 
 cleanup()
 {
@@ -149,15 +148,11 @@ trap cleanup EXIT
 # Start
 # -----------------------------------------------------------------------------
 
-printf '%s\n' "===================================================="
-printf '%s\n' " sk_e1000 PCI/MMIO/IRQ Integration Test"
-printf '%s\n' "===================================================="
+printf '%s\n' "========================================================"
+printf '%s\n' " sk_e1000 PCI/MMIO/DMA/IRQ Integration Test"
+printf '%s\n' "========================================================"
 printf '\n'
 
-
-#
-# Validate sudo credentials before changing kernel or PCI state.
-#
 
 sudo -v
 
@@ -203,15 +198,8 @@ pass "Kernel module exists"
 
 
 # -----------------------------------------------------------------------------
-# 4. Normalize any previous sk_e1000 development run
+# 4. Normalize a previous custom-driver development run
 # -----------------------------------------------------------------------------
-#
-# A developer may have manually loaded sk_e1000 immediately before
-# running this integration test.
-#
-# Remove that previous instance first so this test starts from a known
-# state and validates a fresh probe().
-#
 
 if lsmod | grep -q "^${DRIVER_NAME}[[:space:]]"; then
     sudo rmmod "${DRIVER_NAME}"
@@ -339,7 +327,7 @@ pass "STATUS register MMIO read verified"
 
 
 # -----------------------------------------------------------------------------
-# 13. Preserve previous PCI/MMIO milestone validation
+# 13. Preserve PCI/MMIO milestone validation
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -352,7 +340,7 @@ pass "PCI/MMIO initialization completed"
 
 
 # -----------------------------------------------------------------------------
-# 14. Verify PCI bus mastering in driver log
+# 14. Verify PCI bus mastering initialization
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -365,7 +353,7 @@ pass "PCI bus-master initialization verified"
 
 
 # -----------------------------------------------------------------------------
-# 15. Verify PCI COMMAND Bus Master bit while driver owns device
+# 15. Verify PCI COMMAND Bus Master bit
 # -----------------------------------------------------------------------------
 
 if ! sudo lspci -vv -s "${PCI_DEVICE#0000:}" |
@@ -378,7 +366,92 @@ pass "PCI COMMAND register reports BusMaster+"
 
 
 # -----------------------------------------------------------------------------
-# 16. Verify Linux IRQ handler registration
+# 16. Verify DMA addressing configuration
+# -----------------------------------------------------------------------------
+#
+# The driver prefers 64-bit DMA addressing and can fall back to 32-bit.
+#
+# Do not hard-code 64-bit into the test because the negotiated width is
+# platform-dependent.
+#
+
+DMA_BITS="$(
+    sudo dmesg |
+    sed -n \
+        's/.*sk_e1000: DMA addressing configured: \([0-9][0-9]*\)-bit.*/\1/p' |
+    tail -n 1
+)"
+
+
+case "${DMA_BITS}" in
+
+    64|32)
+        ;;
+
+    *)
+        fail "valid DMA addressing configuration log not found"
+        ;;
+
+esac
+
+pass "DMA addressing configured (${DMA_BITS}-bit)"
+
+
+# -----------------------------------------------------------------------------
+# 17. Verify coherent DMA allocation size
+# -----------------------------------------------------------------------------
+
+if ! sudo dmesg |
+    grep -q \
+    "sk_e1000: coherent DMA memory allocated size=${EXPECTED_DMA_SIZE} bytes"; then
+
+    fail "expected coherent DMA allocation log not found"
+fi
+
+pass "Coherent DMA allocation size verified (${EXPECTED_DMA_SIZE} bytes)"
+
+
+# -----------------------------------------------------------------------------
+# 18. Verify a device-visible DMA address was produced
+# -----------------------------------------------------------------------------
+#
+# A DMA address is not assumed to equal the CPU virtual address.
+#
+# DMA address zero can be valid on some platforms, so this test checks
+# that Linux supplied and the driver logged an address rather than
+# imposing a non-zero requirement.
+#
+
+DMA_ADDRESS="$(
+    sudo dmesg |
+    sed -n \
+        's/.*sk_e1000: coherent DMA address=\(0x[0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' |
+    tail -n 1
+)"
+
+
+if [[ -z "${DMA_ADDRESS}" ]]; then
+    fail "coherent DMA address log not found"
+fi
+
+pass "Device-visible DMA address recorded (${DMA_ADDRESS})"
+
+
+# -----------------------------------------------------------------------------
+# 19. Verify DMA foundation milestone
+# -----------------------------------------------------------------------------
+
+if ! sudo dmesg |
+    grep -q "sk_e1000: DMA foundation PASSED"; then
+
+    fail "DMA foundation validation log not found"
+fi
+
+pass "DMA foundation initialization completed"
+
+
+# -----------------------------------------------------------------------------
+# 20. Verify Linux IRQ handler registration
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -395,7 +468,7 @@ pass "Linux IRQ handler registration verified"
 
 
 # -----------------------------------------------------------------------------
-# 17. Verify deterministic hardware interrupt was triggered
+# 21. Verify deterministic hardware interrupt trigger
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -408,15 +481,8 @@ pass "e1000 LSC interrupt trigger verified"
 
 
 # -----------------------------------------------------------------------------
-# 18. Verify interrupt reached the ISR through the hardware path
+# 22. Verify interrupt reached ISR
 # -----------------------------------------------------------------------------
-#
-# Expected deterministic cause:
-#
-#     ICR = 0x00000004
-#
-# Bit 2 is Link Status Change.
-#
 
 if ! sudo dmesg |
     grep -q "sk_e1000: interrupt received ICR=0x00000004"; then
@@ -428,7 +494,7 @@ pass "ISR received expected ICR=0x00000004"
 
 
 # -----------------------------------------------------------------------------
-# 19. Verify LSC cause handling
+# 23. Verify Link Status Change handling
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -441,7 +507,7 @@ pass "Link Status Change interrupt handled"
 
 
 # -----------------------------------------------------------------------------
-# 20. Verify interrupt synchronization completed
+# 24. Verify interrupt synchronization completed
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -454,20 +520,21 @@ pass "Interrupt delivery validation completed"
 
 
 # -----------------------------------------------------------------------------
-# 21. Verify complete PCI/MMIO/IRQ initialization
+# 25. Verify complete initialization
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
-    grep -q "sk_e1000: PCI/MMIO/IRQ initialization PASSED"; then
+    grep -q \
+    "sk_e1000: PCI/MMIO/DMA/IRQ initialization PASSED"; then
 
-    fail "complete IRQ initialization success log not found"
+    fail "complete DMA/IRQ initialization success log not found"
 fi
 
-pass "PCI/MMIO/IRQ initialization completed"
+pass "PCI/MMIO/DMA/IRQ initialization completed"
 
 
 # -----------------------------------------------------------------------------
-# 22. Unload driver and exercise remove()
+# 26. Unload driver and exercise remove()
 # -----------------------------------------------------------------------------
 
 sudo rmmod "${DRIVER_NAME}"
@@ -480,7 +547,20 @@ pass "sk_e1000 module unloaded"
 
 
 # -----------------------------------------------------------------------------
-# 23. Verify remove() cleanup path
+# 27. Verify coherent DMA resource release
+# -----------------------------------------------------------------------------
+
+if ! sudo dmesg |
+    grep -q "sk_e1000: coherent DMA memory released"; then
+
+    fail "coherent DMA cleanup log not found"
+fi
+
+pass "Coherent DMA memory released"
+
+
+# -----------------------------------------------------------------------------
+# 28. Verify complete driver cleanup path
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -493,7 +573,7 @@ pass "Driver cleanup path verified"
 
 
 # -----------------------------------------------------------------------------
-# 24. Verify IRQ registration was released
+# 29. Verify IRQ registration was released
 # -----------------------------------------------------------------------------
 
 if grep -q "${DRIVER_NAME}" /proc/interrupts; then
@@ -504,7 +584,7 @@ pass "IRQ handler released"
 
 
 # -----------------------------------------------------------------------------
-# 25. Verify custom driver released PCI device
+# 30. Verify custom driver released PCI device
 # -----------------------------------------------------------------------------
 
 if [[ "$(current_driver)" == "${DRIVER_NAME}" ]]; then
@@ -515,13 +595,11 @@ pass "PCI device released by sk_e1000"
 
 
 # -----------------------------------------------------------------------------
-# 26. Verify PCI bus mastering was cleared
+# 31. Verify PCI bus mastering was cleared
 # -----------------------------------------------------------------------------
 #
-# remove() calls pci_clear_master() before releasing the PCI device.
-#
-# Perform this check before the EXIT trap optionally restores the stock
-# e1000 driver, because the stock driver may enable bus mastering again.
+# Perform this before the EXIT trap potentially restores the stock e1000
+# driver because the stock driver may enable bus mastering again.
 #
 
 if ! sudo lspci -vv -s "${PCI_DEVICE#0000:}" |
@@ -538,7 +616,7 @@ pass "PCI COMMAND register reports BusMaster- after cleanup"
 # -----------------------------------------------------------------------------
 
 printf '\n'
-printf '%s\n' "===================================================="
-printf ' ALL %d PCI/MMIO/IRQ INTEGRATION CHECKS PASSED\n' \
+printf '%s\n' "========================================================"
+printf ' ALL %d PCI/MMIO/DMA/IRQ INTEGRATION CHECKS PASSED\n' \
     "${TESTS_RUN}"
-printf '%s\n' "===================================================="
+printf '%s\n' "========================================================"

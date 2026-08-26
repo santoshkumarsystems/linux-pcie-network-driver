@@ -1,0 +1,19 @@
+[ 8715.854116] sk_e1000: matched PCI device 8086:100e
+[ 8715.854908] sk_e1000: PCI bus mastering enabled
+[ 8715.854910] sk_e1000: DMA addressing configured: 64-bit
+[ 8715.854981] sk_e1000: BAR0 physical start=0xfeb00000
+[ 8715.854983] sk_e1000: BAR0 size=131072 bytes
+[ 8715.855098] sk_e1000: CTRL   = 0x40140240
+[ 8715.855099] sk_e1000: STATUS = 0x80080783
+[ 8715.855100] sk_e1000: PCI/MMIO initialization PASSED
+[ 8715.855102] sk_e1000: coherent DMA memory allocated size=4096 bytes
+[ 8715.855102] sk_e1000: coherent DMA address=0x00000000013c8000
+[ 8715.855103] sk_e1000: DMA foundation PASSED
+[ 8715.855201] sk_e1000: IRQ handler registered on IRQ 20
+[ 8715.855218] sk_e1000: triggering LSC interrupt test
+[ 8715.855255] sk_e1000: interrupt received ICR=0x00000004
+[ 8715.855256] sk_e1000: LSC interrupt handled
+[ 8715.855276] sk_e1000: interrupt test PASSED
+[ 8715.855439] sk_e1000: PCI/MMIO/DMA/IRQ initialization PASSED
+[ 8716.007153] sk_e1000: coherent DMA memory released
+[ 8716.007702] sk_e1000: device removed and resources released

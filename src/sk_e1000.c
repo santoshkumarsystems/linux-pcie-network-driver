@@ -1,7 +1,7 @@
 /*
  * sk_e1000.c
  *
- * Linux PCIe network driver for the QEMU-emulated
+ * Linux PCI network driver for the QEMU-emulated
  * Intel 82540EM Gigabit Ethernet Controller.
  *
  * Author: Santosh Kumar
@@ -14,6 +14,8 @@
  *   - BAR0 MMIO mapping
  *   - CTRL and STATUS register access
  *   - PCI bus mastering
+ *   - DMA address-mask negotiation
+ *   - DMA-coherent descriptor memory allocation
  *   - legacy INTx interrupt registration
  *   - e1000 interrupt masking and cause handling
  *   - deterministic interrupt-path validation
@@ -22,7 +24,8 @@
  *
  * Future milestones:
  *
- *   - DMA addressing configuration
+ *   - Intel RX descriptor definition
+ *   - Intel TX descriptor definition
  *   - DMA-backed RX descriptor ring
  *   - DMA-backed TX descriptor ring
  *   - producer / consumer management
@@ -41,8 +44,9 @@
  *   QEMU/KVM emulated PCI hardware
  *   Linux kernel module
  *
- * The driver intentionally discovers runtime PCI resources rather
- * than hard-coding physical BAR addresses or IRQ numbers.
+ * The driver discovers runtime PCI and DMA resources dynamically.
+ * Physical BAR addresses, IRQ numbers, and DMA addresses are never
+ * hard-coded.
  */
 
 #include <linux/module.h>
@@ -54,6 +58,7 @@
 #include <linux/jiffies.h>
 
 #include "sk_e1000_logic.h"
+#include "sk_e1000_dma.h"
 
 
 /*
@@ -67,8 +72,8 @@
  * If they match and the device is available, Linux calls probe().
  */
 
-#define SK_E1000_VENDOR_ID          0x8086
-#define SK_E1000_DEVICE_ID          0x100e
+#define SK_E1000_VENDOR_ID              0x8086
+#define SK_E1000_DEVICE_ID              0x100e
 
 
 /*
@@ -85,11 +90,35 @@
  * allocates the physical address range, and exposes that information
  * through the PCI resource APIs.
  *
- * The driver does NOT hard-code the observed QEMU BAR address
- * (for example 0xfeb00000). That address is runtime platform state.
+ * The driver does NOT hard-code the observed QEMU BAR address.
  */
 
-#define SK_E1000_BAR                0
+#define SK_E1000_BAR                    0
+
+
+/*
+ * --------------------------------------------------------------------------
+ * DMA FOUNDATION
+ * --------------------------------------------------------------------------
+ *
+ * Allocate an initial coherent memory region that will become the
+ * foundation for hardware descriptor storage.
+ *
+ * This milestone intentionally does NOT program the address into RX/TX
+ * hardware registers yet.
+ *
+ * Therefore:
+ *
+ *     coherent DMA memory exists                 YES
+ *     valid device DMA address exists            YES
+ *     NIC packet DMA through descriptors         NOT YET
+ *
+ * 4096 bytes gives the project a real persistent DMA-coherent region
+ * while descriptor formats and separate RX/TX rings are introduced in
+ * the next milestone.
+ */
+
+#define SK_E1000_DESCRIPTOR_MEM_SIZE    4096U
 
 
 /*
@@ -106,8 +135,8 @@
  *     Device Status Register.
  */
 
-#define E1000_REG_CTRL              0x0000
-#define E1000_REG_STATUS            0x0008
+#define E1000_REG_CTRL                  0x0000
+#define E1000_REG_STATUS                0x0008
 
 
 /*
@@ -127,8 +156,8 @@
  *
  *     Allows software to set interrupt-cause bits.
  *
- *     We use this during bring-up to exercise the complete interrupt
- *     path through the QEMU e1000 hardware model.
+ *     Used during bring-up to exercise the complete interrupt path
+ *     through the QEMU e1000 hardware model.
  *
  *
  * IMS = Interrupt Mask Set
@@ -141,17 +170,17 @@
  *     Writing a 1 disables the corresponding interrupt source.
  */
 
-#define E1000_REG_ICR               0x00c0
-#define E1000_REG_ICS               0x00c8
-#define E1000_REG_IMS               0x00d0
-#define E1000_REG_IMC               0x00d8
+#define E1000_REG_ICR                   0x00c0
+#define E1000_REG_ICS                   0x00c8
+#define E1000_REG_IMS                   0x00d0
+#define E1000_REG_IMC                   0x00d8
 
 
 /*
  * Maximum time probe() waits for the deterministic interrupt test.
  */
 
-#define SK_E1000_IRQ_TIMEOUT_MS     1000
+#define SK_E1000_IRQ_TIMEOUT_MS         1000
 
 
 /*
@@ -164,37 +193,61 @@
  *
  * pdev:
  *
- *     Linux's representation of the PCI device.
+ *     Linux representation of the PCI device.
  *
  *
  * bar0:
  *
  *     Kernel virtual address returned by pci_iomap().
  *
- *     This is NOT normal RAM.
+ *     This is device MMIO, not ordinary RAM.
  *
- *     It represents device MMIO and must be accessed with Linux
- *     MMIO accessors such as ioread32() and iowrite32().
+ *
+ * dma_bits:
+ *
+ *     DMA addressing width successfully negotiated with the Linux DMA
+ *     subsystem.
+ *
+ *     The driver first requests 64-bit DMA addressing and falls back
+ *     to 32-bit addressing when necessary.
+ *
+ *
+ * descriptor_mem:
+ *
+ *     Persistent DMA-coherent memory owned by this driver.
+ *
+ *     It contains two distinct address views:
+ *
+ *         cpu_addr
+ *             used by the CPU
+ *
+ *         dma_addr
+ *             used by the device
+ *
+ *     The DMA address will eventually be programmed into the e1000
+ *     descriptor-ring registers.
  *
  *
  * irq_test_done:
  *
- *     Synchronization object used only for our deterministic
- *     interrupt bring-up test.
- *
- *     probe() triggers an interrupt through the hardware model.
- *     The ISR calls complete(), waking probe().
+ *     Synchronization object used only for deterministic interrupt
+ *     bring-up validation.
  *
  *
  * last_icr:
  *
- *     Stores the most recently observed Interrupt Cause Register
- *     value during the test.
+ *     Most recently observed Interrupt Cause Register value during
+ *     validation.
  */
 
 struct sk_e1000_device {
     struct pci_dev *pdev;
+
     void __iomem *bar0;
+
+    unsigned int dma_bits;
+
+    struct sk_e1000_dma_region descriptor_mem;
 
     struct completion irq_test_done;
 
@@ -206,11 +259,6 @@ struct sk_e1000_device {
  * --------------------------------------------------------------------------
  * PCI DEVICE TABLE
  * --------------------------------------------------------------------------
- *
- * PCI_DEVICE() is a Linux kernel macro that fills the Vendor ID and
- * Device ID fields required for PCI matching.
- *
- * The final zero entry terminates the table.
  */
 
 static const struct pci_device_id sk_e1000_pci_ids[] = {
@@ -218,13 +266,6 @@ static const struct pci_device_id sk_e1000_pci_ids[] = {
     { 0, }
 };
 
-
-/*
- * Export the supported PCI IDs as module metadata.
- *
- * This allows the kernel/module tooling to associate this driver
- * with the supported hardware.
- */
 
 MODULE_DEVICE_TABLE(pci, sk_e1000_pci_ids);
 
@@ -236,15 +277,8 @@ MODULE_DEVICE_TABLE(pci, sk_e1000_pci_ids);
  *
  * Stop this NIC from generating interrupt events.
  *
- * This is important during:
- *
- *     - initial bring-up
- *     - error cleanup
- *     - driver removal
- *
- * The interrupt source must be stopped before free_irq() removes the
- * handler, otherwise hardware could generate another interrupt while
- * the handler/resources are being torn down.
+ * Device interrupt generation must be stopped before free_irq()
+ * removes the Linux handler.
  */
 
 static void sk_e1000_disable_interrupts(struct sk_e1000_device *dev)
@@ -257,16 +291,16 @@ static void sk_e1000_disable_interrupts(struct sk_e1000_device *dev)
 
 
     /*
-     * PCI/MMIO writes may be posted.
+     * MMIO writes may be posted.
      *
      * Read STATUS so the previous write reaches the device before
-     * execution proceeds into cleanup.
+     * execution proceeds.
      */
     (void)ioread32(dev->bar0 + E1000_REG_STATUS);
 
 
     /*
-     * Clear any already-pending interrupt causes.
+     * Clear already-pending interrupt causes.
      */
     (void)ioread32(dev->bar0 + E1000_REG_ICR);
 }
@@ -279,24 +313,12 @@ static void sk_e1000_disable_interrupts(struct sk_e1000_device *dev)
  *
  * ISR = Interrupt Service Routine.
  *
- * Linux invokes this function when the PCI interrupt line associated
- * with the device is asserted.
- *
- * This QEMU configuration uses legacy INTx.
- *
  * Legacy INTx interrupts may be shared by multiple PCI devices.
- * Therefore our handler must determine whether the interrupt actually
- * belongs to this NIC.
+ * The handler therefore reads ICR before claiming the interrupt.
  *
- * Hardware access remains here in the kernel driver:
- *
- *     ioread32()
- *         ->
- *     raw ICR cause value
- *
- * Hardware-independent interpretation of that cause value is delegated
- * to sk_e1000_logic.c. The same logic is exercised directly by the
- * user-space unit tests.
+ * Hardware access stays in this file. Hardware-independent cause
+ * interpretation is delegated to sk_e1000_logic.c and is independently
+ * exercised through Unity unit tests.
  */
 
 static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
@@ -305,33 +327,18 @@ static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
     u32 cause;
 
 
-    /*
-     * The current handler does not need the numeric Linux IRQ value.
-     *
-     * The private device pointer identifies the controller whose
-     * registers must be examined.
-     */
     (void)irq;
 
 
     /*
-     * Read ICR = Interrupt Cause Read.
-     *
-     * This identifies which e1000 interrupt source fired.
-     *
-     * Reading ICR also acknowledges the causes returned by the
-     * controller.
+     * Read and acknowledge the Interrupt Cause Register.
      */
     cause = ioread32(dev->bar0 + E1000_REG_ICR);
 
 
     /*
-     * Shared interrupt rule:
-     *
-     * A zero cause means this e1000 device has no pending interrupt.
-     *
-     * sk_e1000_irq_is_pending() is hardware-independent logic shared
-     * with the unit-test environment.
+     * A zero cause means the shared interrupt did not originate from
+     * this controller.
      */
     if (!sk_e1000_irq_is_pending(cause))
         return IRQ_NONE;
@@ -345,13 +352,9 @@ static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
 
 
     /*
-     * Our bring-up test specifically triggers LSC.
+     * Current bring-up validation specifically exercises LSC.
      *
      * LSC = Link Status Change.
-     *
-     * More than one interrupt cause can exist simultaneously, so the
-     * shared helper checks the LSC bit rather than comparing the entire
-     * ICR value.
      */
     if (sk_e1000_irq_has_lsc(cause)) {
 
@@ -359,17 +362,14 @@ static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
 
 
         /*
-         * Signal probe() that the hardware interrupt successfully
-         * travelled through:
+         * Wake probe() after the interrupt successfully travels:
          *
-         *     CPU MMIO write
-         *          ->
-         *     e1000 interrupt logic
-         *          ->
+         *     device
+         *        ->
          *     PCI INTx
-         *          ->
+         *        ->
          *     Linux interrupt subsystem
-         *          ->
+         *        ->
          *     this ISR
          */
         complete(&dev->irq_test_done);
@@ -385,29 +385,25 @@ static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
  * PCI PROBE
  * --------------------------------------------------------------------------
  *
- * Linux calls probe() after:
- *
- *     1. PCI enumeration discovers the device.
- *     2. Vendor/Device ID matches sk_e1000_pci_ids[].
- *     3. The device is available for this driver to bind.
- *
- *
- * Resource acquisition order:
+ * Resource acquisition currently proceeds as:
  *
  *     PCI device enable
  *          ->
  *     PCI bus mastering
  *          ->
+ *     DMA mask negotiation
+ *          ->
  *     BAR0 ownership
  *          ->
- *     driver private memory
+ *     driver-private memory
  *          ->
  *     BAR0 MMIO mapping
  *          ->
+ *     coherent DMA memory
+ *          ->
  *     IRQ registration
  *
- *
- * Failure cleanup releases these resources in reverse order.
+ * Failure handling releases owned resources in reverse order.
  */
 
 static int sk_e1000_probe(struct pci_dev *pdev,
@@ -420,6 +416,8 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
     unsigned long completed;
 
+    unsigned int dma_bits;
+
     u32 ctrl;
     u32 status;
 
@@ -427,9 +425,7 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
 
     /*
-     * The PCI core already used this table entry to perform the
-     * match. The current implementation does not need additional
-     * information from it.
+     * The PCI core already used this entry to match the hardware.
      */
     (void)id;
 
@@ -449,11 +445,6 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      * ENABLE PCI MEMORY RESOURCES
      * ------------------------------------------------------------------
-     *
-     * pci_enable_device_mem() is a Linux PCI API.
-     *
-     * It enables the PCI memory resources required for BAR-based
-     * MMIO communication.
      */
 
     ret = pci_enable_device_mem(pdev);
@@ -471,9 +462,6 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      * VERIFY BAR0 TYPE
      * ------------------------------------------------------------------
-     *
-     * BAR0 must represent memory space because the e1000 register
-     * interface is accessed through MMIO.
      */
 
     if (!(pci_resource_flags(pdev, SK_E1000_BAR) &
@@ -492,21 +480,11 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ENABLE PCI BUS MASTERING
      * ------------------------------------------------------------------
      *
-     * Bus mastering allows the NIC to initiate PCI transactions
-     * rather than only respond to CPU transactions.
+     * Bus mastering allows the NIC to initiate transactions toward
+     * system memory.
      *
-     * This is essential for DMA:
-     *
-     *     RX:
-     *         NIC -> system RAM
-     *
-     *     TX:
-     *         system RAM -> NIC
-     *
-     * No DMA buffers are configured in this milestone yet.
-     *
-     * We enable the PCI capability now because it is part of the
-     * hardware initialization required by the upcoming DMA datapath.
+     * This capability is required before the device can participate
+     * in the future RX/TX DMA datapath.
      */
 
     pci_set_master(pdev);
@@ -517,12 +495,46 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
     /*
      * ------------------------------------------------------------------
-     * ENABLE LEGACY PCI INTx
+     * CONFIGURE DMA ADDRESSING
      * ------------------------------------------------------------------
      *
-     * The current QEMU device configuration uses legacy INTx.
+     * The Linux DMA API determines which device-visible address range
+     * can safely be used.
      *
-     * MSI/MSI-X support can be considered as a later extension.
+     * sk_e1000_dma_configure() attempts:
+     *
+     *     64-bit
+     *        ->
+     *     32-bit fallback
+     *
+     * Initialization must stop if neither mode can be configured.
+     */
+
+    ret =
+        sk_e1000_dma_configure(
+            pdev,
+            &dma_bits);
+
+
+    if (ret) {
+
+        pr_err(
+            "sk_e1000: DMA addressing configuration failed: %d\n",
+            ret);
+
+        goto err_clear_master;
+    }
+
+
+    pr_info(
+        "sk_e1000: DMA addressing configured: %u-bit\n",
+        dma_bits);
+
+
+    /*
+     * ------------------------------------------------------------------
+     * ENABLE LEGACY PCI INTx
+     * ------------------------------------------------------------------
      */
 
     pci_intx(pdev, 1);
@@ -533,19 +545,18 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * DISCOVER BAR0
      * ------------------------------------------------------------------
      *
-     * Linux provides the physical resource values assigned during
-     * PCI enumeration.
-     *
-     * Never hard-code the runtime BAR address.
+     * Runtime BAR values come from Linux PCI resource discovery.
      */
 
     bar_start =
-        pci_resource_start(pdev,
-                           SK_E1000_BAR);
+        pci_resource_start(
+            pdev,
+            SK_E1000_BAR);
 
     bar_len =
-        pci_resource_len(pdev,
-                         SK_E1000_BAR);
+        pci_resource_len(
+            pdev,
+            SK_E1000_BAR);
 
 
     pr_info("sk_e1000: BAR0 physical start=0x%llx\n",
@@ -559,14 +570,14 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      * CLAIM BAR0
      * ------------------------------------------------------------------
-     *
-     * pci_request_region() establishes exclusive driver ownership
-     * of the BAR resource.
      */
 
-    ret = pci_request_region(pdev,
-                             SK_E1000_BAR,
-                             "sk_e1000");
+    ret =
+        pci_request_region(
+            pdev,
+            SK_E1000_BAR,
+            "sk_e1000");
+
 
     if (ret) {
 
@@ -581,12 +592,13 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      * ALLOCATE DRIVER PRIVATE STATE
      * ------------------------------------------------------------------
-     *
-     * kzalloc() allocates kernel memory and initializes it to zero.
      */
 
-    dev = kzalloc(sizeof(*dev),
-                  GFP_KERNEL);
+    dev =
+        kzalloc(
+            sizeof(*dev),
+            GFP_KERNEL);
+
 
     if (!dev) {
 
@@ -597,6 +609,7 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
 
     dev->pdev = pdev;
+    dev->dma_bits = dma_bits;
 
 
     /*
@@ -604,16 +617,15 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * MAP BAR0
      * ------------------------------------------------------------------
      *
-     * pci_iomap() maps the PCI BAR into kernel virtual address
-     * space.
-     *
-     * dev->bar0 is a device-memory mapping, not a normal RAM
-     * pointer.
+     * pci_iomap() produces a kernel virtual mapping for device MMIO.
      */
 
-    dev->bar0 = pci_iomap(pdev,
-                          SK_E1000_BAR,
-                          0);
+    dev->bar0 =
+        pci_iomap(
+            pdev,
+            SK_E1000_BAR,
+            0);
+
 
     if (!dev->bar0) {
 
@@ -629,26 +641,17 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      * REAL MMIO REGISTER ACCESS
      * ------------------------------------------------------------------
-     *
-     * CTRL:
-     *
-     *     BAR0 + 0x0000
-     *
-     * STATUS:
-     *
-     *     BAR0 + 0x0008
-     *
-     * ioread32() must be used for MMIO rather than directly
-     * dereferencing the address as normal memory.
      */
 
     ctrl =
-        ioread32(dev->bar0 +
-                 E1000_REG_CTRL);
+        ioread32(
+            dev->bar0 +
+            E1000_REG_CTRL);
 
     status =
-        ioread32(dev->bar0 +
-                 E1000_REG_STATUS);
+        ioread32(
+            dev->bar0 +
+            E1000_REG_STATUS);
 
 
     pr_info("sk_e1000: CTRL   = 0x%08x\n",
@@ -663,20 +666,63 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
     /*
      * ------------------------------------------------------------------
-     * PREPARE INTERRUPT HARDWARE
+     * ALLOCATE DMA-COHERENT DESCRIPTOR MEMORY
      * ------------------------------------------------------------------
      *
-     * Start with every interrupt source masked and remove stale
-     * causes before registering our handler.
+     * The allocation persists for the lifetime of the driver.
+     *
+     * The CPU receives a normal kernel virtual address while the NIC
+     * receives a separate DMA address generated by the Linux DMA API.
+     *
+     * The device address is NOT programmed into ring registers yet.
+     * That occurs when real RX/TX descriptor rings are introduced.
+     */
+
+    ret =
+        sk_e1000_dma_alloc(
+            pdev,
+            &dev->descriptor_mem,
+            SK_E1000_DESCRIPTOR_MEM_SIZE);
+
+
+    if (ret) {
+
+        pr_err(
+            "sk_e1000: coherent DMA allocation failed: %d\n",
+            ret);
+
+        goto err_unmap_bar;
+    }
+
+
+    pr_info(
+        "sk_e1000: coherent DMA memory allocated size=%zu bytes\n",
+        dev->descriptor_mem.size);
+
+
+    /*
+     * %pad is the Linux kernel formatter for dma_addr_t.
+     *
+     * We report the device-visible address as runtime evidence but
+     * never assume or hard-code its numerical value.
+     */
+
+    pr_info(
+        "sk_e1000: coherent DMA address=%pad\n",
+        &dev->descriptor_mem.dma_addr);
+
+
+    pr_info("sk_e1000: DMA foundation PASSED\n");
+
+
+    /*
+     * ------------------------------------------------------------------
+     * PREPARE INTERRUPT HARDWARE
+     * ------------------------------------------------------------------
      */
 
     sk_e1000_disable_interrupts(dev);
 
-
-    /*
-     * Initialize completion synchronization used by the
-     * deterministic interrupt test.
-     */
 
     init_completion(&dev->irq_test_done);
 
@@ -687,23 +733,16 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      * REGISTER INTERRUPT HANDLER
      * ------------------------------------------------------------------
-     *
-     * request_irq() registers our ISR with the Linux interrupt
-     * subsystem.
-     *
-     * IRQF_SHARED is required for legacy shared INTx interrupts.
-     *
-     * dev is:
-     *
-     *     - passed to the ISR
-     *     - used as the unique dev_id for free_irq()
      */
 
-    ret = request_irq(pdev->irq,
-                      sk_e1000_irq_handler,
-                      IRQF_SHARED,
-                      "sk_e1000",
-                      dev);
+    ret =
+        request_irq(
+            pdev->irq,
+            sk_e1000_irq_handler,
+            IRQF_SHARED,
+            "sk_e1000",
+            dev);
+
 
     if (ret) {
 
@@ -711,7 +750,7 @@ static int sk_e1000_probe(struct pci_dev *pdev,
                pdev->irq,
                ret);
 
-        goto err_unmap_bar;
+        goto err_free_dma;
     }
 
 
@@ -721,23 +760,23 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
     /*
      * ------------------------------------------------------------------
-     * ENABLE THE TEST INTERRUPT
+     * ENABLE DETERMINISTIC TEST INTERRUPT
      * ------------------------------------------------------------------
-     *
-     * Enable only the LSC cause.
      */
 
-    iowrite32(SK_E1000_INT_LSC,
-              dev->bar0 +
-              E1000_REG_IMS);
+    iowrite32(
+        SK_E1000_INT_LSC,
+        dev->bar0 +
+        E1000_REG_IMS);
 
 
     /*
-     * Flush the posted MMIO write.
+     * Flush the posted interrupt-mask write.
      */
 
-    (void)ioread32(dev->bar0 +
-                   E1000_REG_STATUS);
+    (void)ioread32(
+        dev->bar0 +
+        E1000_REG_STATUS);
 
 
     /*
@@ -745,45 +784,39 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * TRIGGER INTERRUPT THROUGH HARDWARE MODEL
      * ------------------------------------------------------------------
      *
-     * Writing the LSC bit into ICS does NOT directly call our ISR.
+     * The ISR is not called directly.
      *
-     * Instead:
-     *
-     *     CPU executes MMIO write
+     *     CPU MMIO write to ICS
      *              |
      *              v
-     *     QEMU e1000 receives register write
+     *     e1000 hardware model
      *              |
      *              v
-     *     e1000 sets interrupt cause
-     *              |
-     *              v
-     *     PCI INTx asserted
+     *     PCI INTx assertion
      *              |
      *              v
      *     Linux interrupt subsystem
      *              |
      *              v
      *     sk_e1000_irq_handler()
-     *
-     * This provides deterministic validation of the real interrupt
-     * delivery path exposed by the emulated NIC.
      */
 
     pr_info("sk_e1000: triggering LSC interrupt test\n");
 
 
-    iowrite32(SK_E1000_INT_LSC,
-              dev->bar0 +
-              E1000_REG_ICS);
+    iowrite32(
+        SK_E1000_INT_LSC,
+        dev->bar0 +
+        E1000_REG_ICS);
 
 
     /*
      * Flush the posted ICS write.
      */
 
-    (void)ioread32(dev->bar0 +
-                   E1000_REG_STATUS);
+    (void)ioread32(
+        dev->bar0 +
+        E1000_REG_STATUS);
 
 
     /*
@@ -791,15 +824,11 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * WAIT FOR ISR
      * ------------------------------------------------------------------
      *
-     * Interrupt handling is asynchronous.
+     * This completion exists only for deterministic bring-up
+     * validation.
      *
-     * The CPU cannot assume the interrupt completed immediately
-     * after the MMIO write.
-     *
-     * probe() waits for the ISR to signal irq_test_done.
-     *
-     * This completion is a bring-up validation mechanism. It is not
-     * intended to serialize the future RX/TX DMA datapath.
+     * Future RX/TX packet processing will remain asynchronous and will
+     * not wait synchronously for every DMA operation.
      */
 
     completed =
@@ -820,11 +849,7 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
 
     /*
-     * Validate that the interrupt observed by our ISR contained
-     * the expected LSC test cause.
-     *
-     * Use the same shared decision function exercised by our unit
-     * tests rather than duplicating the bit-test logic here.
+     * Verify the expected interrupt cause.
      */
 
     if (!sk_e1000_irq_has_lsc(dev->last_icr)) {
@@ -843,56 +868,50 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
 
     /*
-     * The deterministic bring-up test is finished.
+     * The deterministic interrupt test is complete.
      *
-     * Mask interrupts again until normal RX/TX interrupt handling
-     * is introduced.
+     * Keep normal interrupts masked until RX/TX datapath
+     * initialization is implemented.
      */
 
     sk_e1000_disable_interrupts(dev);
 
 
     /*
-     * Associate our private state with the pci_dev only after the
-     * initialization sequence has succeeded.
-     *
-     * remove() later retrieves it using pci_get_drvdata().
+     * Publish driver-private state only after complete initialization.
      */
 
-    pci_set_drvdata(pdev,
-                    dev);
+    pci_set_drvdata(
+        pdev,
+        dev);
 
 
     /*
-     * Successful milestone:
+     * Current successful initialization path:
      *
-     * PCI enumeration
+     * PCI match
      *      ->
-     * PCI ID match
-     *      ->
-     * PCI device enable
+     * PCI enable
      *      ->
      * bus mastering
      *      ->
-     * BAR0 discovery
+     * DMA mask negotiation
      *      ->
-     * BAR0 ownership
+     * BAR0 discovery / ownership
      *      ->
      * MMIO mapping
      *      ->
-     * CTRL/STATUS reads
+     * coherent DMA allocation
      *      ->
      * IRQ registration
      *      ->
      * hardware interrupt
      *      ->
-     * shared cause interpretation
-     *      ->
-     * ISR execution
+     * ISR validation
      */
 
     pr_info(
-        "sk_e1000: PCI/MMIO/IRQ initialization PASSED\n");
+        "sk_e1000: PCI/MMIO/DMA/IRQ initialization PASSED\n");
 
 
     return 0;
@@ -903,10 +922,7 @@ static int sk_e1000_probe(struct pci_dev *pdev,
  * ERROR UNWIND
  * --------------------------------------------------------------------------
  *
- * Every label releases only resources acquired before reaching that
- * point.
- *
- * Cleanup proceeds in reverse acquisition order.
+ * Resources are released in reverse acquisition order.
  */
 
 
@@ -915,21 +931,32 @@ err_free_irq:
     /*
      * Stop hardware interrupt generation before removing the ISR.
      */
+
     sk_e1000_disable_interrupts(dev);
 
 
-    /*
-     * The ISR accesses BAR0, so free_irq() must happen before BAR0
-     * is unmapped.
-     */
-    free_irq(pdev->irq,
-             dev);
+    free_irq(
+        pdev->irq,
+        dev);
+
+
+/*
+ * The IRQ is now gone, so DMA memory can no longer become reachable
+ * from future interrupt handling.
+ */
+
+err_free_dma:
+
+    sk_e1000_dma_free(
+        pdev,
+        &dev->descriptor_mem);
 
 
 err_unmap_bar:
 
-    pci_iounmap(pdev,
-                dev->bar0);
+    pci_iounmap(
+        pdev,
+        dev->bar0);
 
 
 err_free_dev:
@@ -939,16 +966,13 @@ err_free_dev:
 
 err_release_region:
 
-    pci_release_region(pdev,
-                       SK_E1000_BAR);
+    pci_release_region(
+        pdev,
+        SK_E1000_BAR);
 
 
 err_clear_master:
 
-    /*
-     * Remove PCI bus-master capability because initialization
-     * failed and this driver is releasing the hardware.
-     */
     pci_clear_master(pdev);
 
 
@@ -966,27 +990,26 @@ err_disable_device:
  * DRIVER REMOVE
  * --------------------------------------------------------------------------
  *
- * Called when:
+ * Current teardown order:
  *
- *     - the module is unloaded, or
- *     - the driver is explicitly unbound from the PCI device.
- *
- *
- * Resource cleanup order:
- *
- *     disable NIC interrupts
+ *     mask NIC interrupts
  *          ->
  *     free Linux IRQ
  *          ->
+ *     free coherent DMA memory
+ *          ->
  *     unmap BAR0
  *          ->
- *     free private memory
+ *     free private state
  *          ->
  *     clear PCI bus mastering
  *          ->
  *     release BAR0
  *          ->
  *     disable PCI device
+ *
+ * IRQ teardown occurs before DMA/MMIO teardown because the ISR may
+ * eventually consume descriptor state and already accesses BAR0.
  */
 
 static void sk_e1000_remove(struct pci_dev *pdev)
@@ -1000,58 +1023,79 @@ static void sk_e1000_remove(struct pci_dev *pdev)
     if (dev) {
 
         /*
-         * Stop the device from generating new interrupts before
-         * the Linux handler is removed.
+         * Prevent new device interrupts before removing the handler.
          */
+
         sk_e1000_disable_interrupts(dev);
 
 
         /*
-         * The ISR accesses BAR0.
+         * The ISR accesses BAR0 and future versions will access
+         * descriptor state.
          *
-         * Therefore:
-         *
-         *     free_irq()
-         *
-         * must happen before:
-         *
-         *     pci_iounmap()
+         * Remove it before freeing either resource.
          */
-        free_irq(pdev->irq,
-                 dev);
+
+        free_irq(
+            pdev->irq,
+            dev);
+
+
+        /*
+         * Release DMA-coherent memory while the PCI device is still
+         * enabled and associated with the same DMA API context used
+         * during allocation.
+         */
+
+        sk_e1000_dma_free(
+            pdev,
+            &dev->descriptor_mem);
+
+
+        pr_info(
+            "sk_e1000: coherent DMA memory released\n");
 
 
         /*
          * Remove the kernel virtual MMIO mapping.
          */
-        if (dev->bar0)
-            pci_iounmap(pdev,
-                        dev->bar0);
+
+        if (dev->bar0) {
+
+            pci_iounmap(
+                pdev,
+                dev->bar0);
+        }
 
 
         /*
          * Release driver-private kernel memory.
          */
+
         kfree(dev);
     }
 
 
     /*
-     * Disable the NIC's ability to initiate PCI transactions.
+     * Disable the device's ability to initiate PCI transactions.
      */
+
     pci_clear_master(pdev);
 
 
     /*
-     * Give BAR0 ownership back to the PCI subsystem.
+     * Return BAR0 ownership to the PCI subsystem.
      */
-    pci_release_region(pdev,
-                       SK_E1000_BAR);
+
+    pci_release_region(
+        pdev,
+        SK_E1000_BAR);
 
 
     /*
      * Disable PCI memory resources enabled during probe().
      */
+
     pci_disable_device(pdev);
 
 
@@ -1064,22 +1108,6 @@ static void sk_e1000_remove(struct pci_dev *pdev)
  * --------------------------------------------------------------------------
  * LINUX PCI DRIVER REGISTRATION
  * --------------------------------------------------------------------------
- *
- * name:
- *
- *     Kernel-visible driver name.
- *
- * id_table:
- *
- *     PCI hardware supported by this module.
- *
- * probe:
- *
- *     Called when compatible hardware is bound.
- *
- * remove:
- *
- *     Called when the driver releases the device.
  */
 
 static struct pci_driver sk_e1000_driver = {
@@ -1091,12 +1119,8 @@ static struct pci_driver sk_e1000_driver = {
 
 
 /*
- * module_pci_driver() is a Linux convenience macro.
- *
- * At module load it effectively registers sk_e1000_driver with the
- * PCI core.
- *
- * At module unload it unregisters the PCI driver.
+ * module_pci_driver() registers this driver with the Linux PCI core
+ * during module initialization and unregisters it during module exit.
  */
 
 module_pci_driver(sk_e1000_driver);
@@ -1105,4 +1129,4 @@ module_pci_driver(sk_e1000_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Santosh Kumar");
 MODULE_DESCRIPTION(
-    "Linux PCIe network driver for QEMU Intel 82540EM");
+    "Linux PCI network driver for QEMU Intel 82540EM");

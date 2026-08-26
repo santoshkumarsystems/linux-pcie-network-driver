@@ -2,7 +2,7 @@
 #
 # Makefile
 #
-# Build configuration for the sk_e1000 Linux PCIe network driver
+# Build configuration for the sk_e1000 Linux network driver
 # and its hardware-independent user-space unit tests.
 #
 # Author: Santosh Kumar
@@ -21,9 +21,9 @@
 #   make clean
 #       Remove kernel-module and unit-test build artifacts.
 #
-# Hardware-dependent integration tests are intentionally kept
-# separate because they require the QEMU development VM, root
-# privileges, and access to the dedicated emulated e1000 device.
+# Hardware-dependent integration tests remain separate because they
+# require the QEMU development VM, root privileges, and access to the
+# dedicated Intel 82540EM device.
 
 
 # ============================================================================
@@ -42,23 +42,33 @@ obj-m += sk_e1000.o
 # sk_e1000.ko is a composite kernel module built from:
 #
 #     src/sk_e1000.c
-#         PCI lifecycle, MMIO access, interrupt handling,
-#         and hardware/resource management.
+#         PCI lifecycle, BAR/MMIO access, interrupt handling,
+#         initialization, teardown, and device ownership.
 #
 #     src/sk_e1000_logic.c
-#         Hardware-independent decision logic shared with
-#         user-space unit tests.
+#         Hardware-independent interrupt decision logic shared
+#         with user-space unit tests.
+#
+#     src/sk_e1000_dma.c
+#         Linux DMA API integration, DMA mask negotiation,
+#         coherent allocation, and DMA resource cleanup.
 #
 sk_e1000-objs := \
 	src/sk_e1000.o \
-	src/sk_e1000_logic.o
+	src/sk_e1000_logic.o \
+	src/sk_e1000_dma.o
 
 
 #
 # Project headers.
 #
-# $(src) is supplied by Kbuild and identifies the root of this
-# external kernel-module source tree.
+# $(src) is provided by Kbuild and identifies the root directory
+# of this external kernel-module source tree.
+#
+# This allows source files to use:
+#
+#     #include "sk_e1000_logic.h"
+#     #include "sk_e1000_dma.h"
 #
 ccflags-y += -I$(src)/include
 
@@ -67,9 +77,8 @@ ccflags-y += -I$(src)/include
 # Build against the currently running kernel unless KDIR is
 # explicitly supplied by the caller.
 #
-# Example inside the QEMU VM:
-#
-#     /lib/modules/6.8.0-138-generic/build
+# Inside the QEMU VM this resolves to the matching Ubuntu kernel
+# build directory.
 #
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
@@ -81,7 +90,7 @@ PWD := $(shell pwd)
 # ============================================================================
 
 #
-# Unit tests run outside the kernel and exercise only pure,
+# Unit tests run outside the kernel and exercise pure,
 # hardware-independent production logic.
 #
 # The same src/sk_e1000_logic.c implementation is linked into:
@@ -89,7 +98,9 @@ PWD := $(shell pwd)
 #     1. sk_e1000.ko
 #     2. the Unity unit-test executable
 #
-# This avoids duplicating production logic inside the tests.
+# Linux DMA API operations are intentionally not mocked here.
+# DMA allocation and cleanup are validated through QEMU integration
+# tests against the real Linux DMA subsystem.
 #
 
 UNIT_CC := gcc
@@ -106,10 +117,10 @@ UNIT_TEST_SRCS := \
 
 
 #
-# Keep compiler diagnostics strict for project-owned unit-test code.
+# Compiler diagnostics for project-owned unit-test code.
 #
-# -MMD/-MP generate dependency files so changes to included headers
-# cause the test binary to be rebuilt automatically.
+# -MMD and -MP generate dependency files so changes to included
+# headers automatically rebuild the test executable.
 #
 UNIT_CFLAGS := \
 	-std=c11 \
@@ -154,8 +165,12 @@ module:
 #
 # Build and execute the Unity unit tests.
 #
-# These tests do not require QEMU, a PCI device, root privileges,
-# or Linux kernel headers.
+# These tests do not require:
+#
+#     - QEMU
+#     - a PCI device
+#     - root privileges
+#     - Linux kernel headers
 #
 unit-test: unit-test-build
 	./$(UNIT_TEST_BIN)
@@ -179,9 +194,9 @@ $(UNIT_TEST_BIN): $(UNIT_TEST_SRCS) include/sk_e1000_logic.h
 #
 # Remove both user-space test artifacts and kernel-module artifacts.
 #
-# The kernel cleanup is performed only when a matching Kbuild
-# directory exists. This allows "make clean" to remain usable from
-# WSL, where Microsoft WSL kernel headers may not be installed.
+# Kernel cleanup is performed only when the matching Kbuild directory
+# exists. This keeps "make clean" usable from WSL even when Microsoft
+# WSL kernel headers are not installed.
 #
 clean:
 	@rm -rf build
@@ -194,6 +209,6 @@ clean:
 
 
 #
-# Include automatically generated user-space header dependencies.
+# Automatically generated user-space header dependencies.
 #
 -include $(UNIT_BUILD_DIR)/*.d

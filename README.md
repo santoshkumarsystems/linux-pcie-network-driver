@@ -3,10 +3,18 @@
 A Linux kernel network-driver project for a QEMU-emulated Intel 82540EM
 Gigabit Ethernet Controller.
 
-The project demonstrates low-level hardware/software interaction through
-PCI device discovery, Base Address Registers (BARs), Memory-Mapped I/O
-(MMIO), bus mastering, hardware interrupts, Direct Memory Access (DMA),
-descriptor rings, and the Linux networking subsystem.
+The project is being built to demonstrate low-level hardware/software
+interaction through:
+
+- PCI device discovery
+- Base Address Registers (BARs)
+- Memory-Mapped I/O (MMIO)
+- PCI bus mastering
+- hardware interrupts
+- Direct Memory Access (DMA)
+- descriptor rings
+- Receive (RX) and Transmit (TX) packet processing
+- Linux networking integration
 
 The current hardware target is the QEMU `e1000` device:
 
@@ -15,10 +23,11 @@ The current hardware target is the QEMU `e1000` device:
 - PCI Device ID: `0x100e`
 - QEMU device model: `e1000`
 
-The Intel 82540EM uses a conventional PCI system interface. The Linux PCI
-driver mechanisms demonstrated here—resource discovery, MMIO, interrupts,
-DMA, ownership, ordering, and cleanup—are also fundamental to PCIe device
-drivers.
+The Intel 82540EM uses a conventional PCI system interface.
+
+The Linux PCI driver mechanisms demonstrated here—resource discovery, MMIO,
+bus mastering, interrupts, DMA, ownership, ordering, and cleanup—are also
+fundamental to PCIe device drivers.
 
 
 ## Use Case
@@ -41,9 +50,9 @@ programming target because a single device combines:
 - Linux kernel resource management
 - Linux networking integration
 
-The goal is to build one coherent driver that moves Ethernet frames between
-Linux and a dedicated QEMU-emulated NIC while exposing the hardware/software
-contract clearly.
+The goal is to build one coherent driver that eventually moves Ethernet
+frames between Linux and a dedicated QEMU-emulated NIC while exposing the
+hardware/software contract clearly.
 
 
 ## Why This Project
@@ -70,27 +79,27 @@ functionality already provided by the Linux kernel.
 The QEMU virtual machine uses two network devices.
 
 ```text
-                        QEMU Linux VM
-
-                 +------------------------+
-                 |                        |
-                 |                        |
-          Management NIC             Project NIC
-             Virtio                   Intel e1000
-                 |                     82540EM
-                 |                        |
-         Linux virtio driver        sk_e1000 driver
-                 |                        |
-          SSH / management          PCI resources
-                                      BAR0 / MMIO
-                                      bus mastering
-                                      interrupts
-                                      DMA
-                                      RX ring
-                                      TX ring
-                                         |
-                                         v
-                                      Network
+                         QEMU Linux VM
+                 +--------------------------+
+                 |                          |
+                 |                          |
+          Management NIC              Project NIC
+              Virtio                   Intel e1000
+                 |                       82540EM
+                 |                          |
+        Linux virtio driver         sk_e1000 driver
+                 |                          |
+          SSH / management              PCI resources
+                                         BAR0 / MMIO
+                                         bus mastering
+                                         interrupts
+                                         DMA foundation
+                                              |
+                                              v
+                                      Planned RX/TX rings
+                                              |
+                                              v
+                                      Planned networking
 ```
 
 The Virtio NIC remains controlled by the standard Linux driver so management
@@ -121,6 +130,13 @@ Validate BAR0 as MMIO
 Enable PCI bus mastering
         |
         v
+Configure DMA addressing
+        |
+        +--> try 64-bit DMA
+        |
+        +--> fall back to 32-bit DMA if required
+        |
+        v
 Discover BAR0
         |
         v
@@ -134,6 +150,13 @@ Map BAR0 into kernel virtual address space
         |
         v
 Read CTRL and STATUS through MMIO
+        |
+        v
+Allocate coherent DMA memory
+        |
+        +--> CPU virtual address
+        |
+        +--> device-visible DMA address
         |
         v
 Mask / clear stale interrupt causes
@@ -163,8 +186,31 @@ Read / acknowledge ICR
 Validate Link Status Change cause
         |
         v
-Initialization PASS
+PCI/MMIO/DMA/IRQ initialization PASS
 ```
+
+The DMA allocation established in the current milestone is persistent coherent
+memory owned by the driver.
+
+Linux provides two address views for the same allocation:
+
+```text
+CPU                         NIC
+ |                           |
+ v                           v
+cpu_addr                  dma_addr
+   \                         /
+    \                       /
+     +---- same memory ----+
+```
+
+The CPU virtual address is used by kernel code.
+
+The DMA address is the device-visible address that may later be programmed
+into NIC descriptor-ring registers.
+
+The current driver does **not** yet program RX or TX descriptor rings and does
+not claim packet DMA functionality.
 
 
 ## MMIO
@@ -185,8 +231,93 @@ Current register access includes:
 - `IMS` — Interrupt Mask Set
 - `IMC` — Interrupt Mask Clear
 
-Device registers are accessed with Linux MMIO accessors such as
-`ioread32()` and `iowrite32()` rather than normal memory dereferences.
+Device registers are accessed with Linux MMIO accessors such as:
+
+```c
+ioread32()
+iowrite32()
+```
+
+rather than normal memory dereferences.
+
+
+## DMA Foundation
+
+DMA = Direct Memory Access.
+
+DMA allows a device to access system memory without requiring the CPU to copy
+every byte between the device and RAM.
+
+Before using DMA, the driver must establish which DMA addresses the platform
+can safely provide to the device.
+
+The current driver performs:
+
+```text
+Enable PCI bus mastering
+        |
+        v
+Request 64-bit DMA addressing
+        |
+        +---- success ----> use 64-bit DMA
+        |
+        v
+Request 32-bit DMA addressing
+        |
+        +---- success ----> use 32-bit DMA
+        |
+        v
+Initialization failure
+```
+
+The implementation uses the Linux DMA API:
+
+```c
+dma_set_mask_and_coherent()
+dma_alloc_coherent()
+dma_free_coherent()
+```
+
+The driver never assumes that a CPU virtual address can be directly supplied
+to the NIC.
+
+A coherent DMA allocation provides:
+
+```text
+               one memory allocation
+                       |
+           +-----------+-----------+
+           |                       |
+           v                       v
+      CPU address              DMA address
+      cpu_addr                 dma_addr
+           |                       |
+           |                       |
+        CPU access               NIC access
+```
+
+The current milestone allocates a 4096-byte coherent DMA region.
+
+That region establishes:
+
+- DMA mask negotiation
+- coherent DMA allocation
+- explicit CPU/device address separation
+- DMA ownership
+- DMA lifetime tracking
+- DMA cleanup
+
+It does **not** yet establish:
+
+- Intel RX descriptor structures
+- Intel TX descriptor structures
+- RX descriptor-ring programming
+- TX descriptor-ring programming
+- packet-buffer DMA mappings
+- actual packet receive DMA
+- actual packet transmit DMA
+
+Those are separate future milestones.
 
 
 ## Interrupt Handling
@@ -234,9 +365,12 @@ LSC detected
 Interrupt validation PASS
 ```
 
-The completion object currently used during `probe()` is a bring-up
-validation mechanism. It is not intended to serialize the future RX/TX
-packet datapath.
+ISR = Interrupt Service Routine.
+
+The completion object currently used during `probe()` is a bring-up validation
+mechanism.
+
+It is not intended to serialize the future RX/TX packet datapath.
 
 
 ## Shared Production Logic
@@ -245,15 +379,15 @@ Hardware-independent interrupt decision logic is separated from kernel and
 MMIO operations.
 
 ```text
-                   include/sk_e1000_logic.h
-                            |
-                            v
-                    src/sk_e1000_logic.c
-                       /             \
-                      /               \
-                     v                 v
-             src/sk_e1000.c     Unity unit tests
-             kernel driver
+                  include/sk_e1000_logic.h
+                           |
+                           v
+                   src/sk_e1000_logic.c
+                      /             \
+                     /               \
+                    v                 v
+            src/sk_e1000.c      Unity unit tests
+            kernel driver
 ```
 
 The same implementation is therefore:
@@ -268,6 +402,9 @@ Current shared logic validates:
 - whether an Interrupt Cause Register value represents a pending interrupt
 - whether Link Status Change is present
 - correct handling of multiple simultaneous interrupt-cause bits
+
+Future shared production logic will also contain suitable
+hardware-independent descriptor-ring operations.
 
 
 ## Planned Receive Path
@@ -397,9 +534,11 @@ linux-pcie-network-driver/
 +-- src/
 |   +-- sk_e1000.c
 |   +-- sk_e1000_logic.c
+|   +-- sk_e1000_dma.c
 |
 +-- include/
 |   +-- sk_e1000_logic.h
+|   +-- sk_e1000_dma.h
 |
 +-- docs/
 |   +-- hardware-target.md
@@ -409,6 +548,8 @@ linux-pcie-network-driver/
 |       +-- pci-mmio-dmesg.txt
 |       +-- pci-mmio-irq-integration.txt
 |       +-- pci-mmio-irq-dmesg.txt
+|       +-- pci-mmio-dma-irq-integration.txt
+|       +-- pci-mmio-dma-irq-dmesg.txt
 |       +-- irq-logic-unit-tests.txt
 |
 +-- tests/
@@ -416,7 +557,7 @@ linux-pcie-network-driver/
 |   |   +-- test_irq_logic.c
 |   |
 |   +-- integration/
-|       +-- test_pci_mmio_irq.sh
+|       +-- test_pci_mmio_dma_irq.sh
 |
 +-- third_party/
 |   +-- unity/
@@ -429,8 +570,8 @@ linux-pcie-network-driver/
 +-- scripts/
 ```
 
-Generated kernel and unit-test build artifacts are excluded from source
-control.
+Generated kernel-module and user-space unit-test artifacts are excluded from
+source control.
 
 
 ## Testing Strategy
@@ -449,8 +590,11 @@ The tests compile the same production implementation contained in:
 src/sk_e1000_logic.c
 ```
 
-No PCI device, MMIO implementation, interrupt controller, or QEMU hardware is
-mocked.
+No PCI device, MMIO implementation, interrupt controller, DMA subsystem, or
+QEMU hardware is mocked.
+
+Hardware-dependent DMA behavior is validated through integration testing
+against Linux and the QEMU e1000 device.
 
 Current unit coverage:
 
@@ -488,15 +632,16 @@ Future hardware-independent unit coverage will include:
 Kernel-specific helper logic may use KUnit where doing so provides meaningful
 coverage.
 
-KUnit will not be added simply to increase test count. Hardware behavior that
-is better validated against the actual QEMU device remains an integration-test
-responsibility.
+KUnit will not be added simply to increase test count.
+
+Hardware behavior that is better validated against the actual QEMU device
+remains an integration-test responsibility.
 
 
 ### Integration Tests
 
 The integration suite operates against the QEMU-emulated Intel 82540EM and
-the real Linux PCI and interrupt subsystems.
+the real Linux PCI, DMA, MMIO, and interrupt subsystems.
 
 Current automated validation includes:
 
@@ -514,14 +659,20 @@ Current automated validation includes:
 - PCI/MMIO initialization
 - PCI bus-master initialization
 - PCI `BusMaster+` state
+- DMA addressing configuration
+- 64-bit or 32-bit DMA negotiation validation
+- coherent DMA allocation size
+- device-visible DMA address creation
+- DMA foundation initialization
 - Linux IRQ handler registration
 - e1000 LSC interrupt generation
 - ISR execution
 - expected `ICR=0x00000004`
 - Link Status Change handling
 - interrupt completion validation
-- complete PCI/MMIO/IRQ initialization
+- complete PCI/MMIO/DMA/IRQ initialization
 - module unload
+- coherent DMA memory release
 - driver cleanup
 - IRQ handler release
 - PCI device release
@@ -530,16 +681,16 @@ Current automated validation includes:
 Current result:
 
 ```text
-24 integration checks
-24 passed
+29 integration checks
+29 passed
 0 failed
 ```
 
 
 ## Current Status
 
-The driver currently implements and validates the PCI/MMIO and interrupt
-bring-up path against a QEMU-emulated Intel 82540EM (`8086:100e`).
+The driver currently implements and validates the PCI/MMIO/DMA/IRQ bring-up
+path against a QEMU-emulated Intel 82540EM (`8086:100e`).
 
 Implemented functionality:
 
@@ -553,6 +704,12 @@ Implemented functionality:
 - Intel CTRL register access
 - Intel STATUS register access
 - PCI bus mastering
+- DMA addressing configuration
+- 64-bit DMA negotiation with 32-bit fallback
+- coherent DMA memory allocation
+- CPU virtual address and DMA address separation
+- DMA ownership and lifetime tracking
+- DMA cleanup
 - legacy INTx registration
 - interrupt masking
 - interrupt cause detection
@@ -566,6 +723,18 @@ Implemented functionality:
 - PCI resource release
 - automated user-space unit testing
 - automated QEMU integration testing
+- committed runtime evidence
+
+Not yet implemented:
+
+- Intel RX descriptors
+- Intel TX descriptors
+- RX descriptor ring
+- TX descriptor ring
+- packet-buffer DMA mappings
+- packet receive
+- packet transmit
+- Linux `net_device` integration
 
 
 ### Observed Test Environment
@@ -573,51 +742,65 @@ Implemented functionality:
 Current observed values from the QEMU development VM:
 
 ```text
-PCI device:      0000:00:04.0
-Vendor / Device: 8086:100e
-BAR0 base:       0xfeb00000
-BAR0 size:       128 KiB
-Linux IRQ:       20
-CTRL:            0x40140240
-STATUS:          0x80080783
-Test ICR:        0x00000004
+PCI device:              0000:00:04.0
+Vendor / Device:         8086:100e
+BAR0 base:               0xfeb00000
+BAR0 size:               128 KiB
+Linux IRQ:               20
+CTRL:                    0x40140240
+STATUS:                  0x80080783
+Test ICR:                0x00000004
+DMA addressing:          64-bit
+Coherent DMA allocation: 4096 bytes
 ```
 
 These values are runtime observations, not hard-coded driver assumptions.
 
+The coherent DMA address itself is intentionally not documented as a fixed
+value because it is dynamically assigned and may differ between runs.
+
 
 ## Runtime Evidence
 
-Validation output is committed so implemented claims can be traced to an
-actual test run.
+Validation output is committed so implemented claims can be traced to actual
+test runs.
 
 
-### Current PCI/MMIO/IRQ Milestone
+### Current PCI/MMIO/DMA/IRQ Milestone
+
+QEMU integration-test result:
+
+- [`docs/evidence/pci-mmio-dma-irq-integration.txt`](docs/evidence/pci-mmio-dma-irq-integration.txt)
+
+Kernel driver log:
+
+- [`docs/evidence/pci-mmio-dma-irq-dmesg.txt`](docs/evidence/pci-mmio-dma-irq-dmesg.txt)
+
+Integration-test source:
+
+- [`tests/integration/test_pci_mmio_dma_irq.sh`](tests/integration/test_pci_mmio_dma_irq.sh)
 
 Unity unit-test result:
 
 - [`docs/evidence/irq-logic-unit-tests.txt`](docs/evidence/irq-logic-unit-tests.txt)
-
-QEMU integration-test result:
-
-- [`docs/evidence/pci-mmio-irq-integration.txt`](docs/evidence/pci-mmio-irq-integration.txt)
-
-Kernel driver log:
-
-- [`docs/evidence/pci-mmio-irq-dmesg.txt`](docs/evidence/pci-mmio-irq-dmesg.txt)
-
-Integration-test source:
-
-- [`tests/integration/test_pci_mmio_irq.sh`](tests/integration/test_pci_mmio_irq.sh)
 
 Unit-test source:
 
 - [`tests/unit/test_irq_logic.c`](tests/unit/test_irq_logic.c)
 
 
+### Previous PCI/MMIO/IRQ Milestone
+
+The earlier interrupt milestone remains available as development-history
+evidence:
+
+- [`docs/evidence/pci-mmio-irq-integration.txt`](docs/evidence/pci-mmio-irq-integration.txt)
+- [`docs/evidence/pci-mmio-irq-dmesg.txt`](docs/evidence/pci-mmio-irq-dmesg.txt)
+
+
 ### Previous PCI/MMIO Milestone
 
-The earlier PCI/MMIO-only milestone remains available as development-history
+The original PCI/MMIO milestone remains available as development-history
 evidence:
 
 - [`docs/evidence/pci-mmio-integration.txt`](docs/evidence/pci-mmio-integration.txt)
@@ -628,47 +811,72 @@ evidence:
 
 Driver initialization acquires hardware and kernel resources in stages.
 
-Current acquisition order:
+Current acquisition sequence:
 
 ```text
 PCI device enable
         |
+        v
 PCI bus-master enable
         |
+        v
+DMA mask configuration
+        |
+        v
 BAR0 ownership
         |
+        v
 driver-private memory
         |
+        v
 BAR0 MMIO mapping
         |
+        v
+coherent DMA allocation
+        |
+        v
 IRQ registration
 ```
 
-Cleanup releases resources in reverse ownership order.
+Cleanup is dependency-safe and generally releases resources in reverse
+acquisition order.
 
 Current remove path:
 
 ```text
 mask device interrupts
         |
+        v
 free Linux IRQ
         |
+        v
+free coherent DMA memory
+        |
+        v
 unmap BAR0
         |
-free private state
+        v
+free driver-private state
         |
+        v
 clear PCI bus mastering
         |
+        v
 release BAR0
         |
+        v
 disable PCI device
 ```
 
-The IRQ handler is released before BAR0 is unmapped because the interrupt
-service routine accesses BAR0.
+The IRQ handler is released before DMA and MMIO resources are destroyed
+because the ISR currently accesses BAR0 and future versions may consume
+descriptor state.
 
-Future DMA resources will be inserted into this ownership model together with
-their corresponding failure and teardown paths.
+The coherent DMA allocation is released while the PCI device and its DMA API
+context are still valid.
+
+Error paths use the same ownership model so partially initialized devices
+release only resources that were successfully acquired.
 
 
 ## Design Principles
@@ -683,22 +891,24 @@ their corresponding failure and teardown paths.
 
 5. Make CPU and NIC ownership explicit.
 
-6. Treat DMA and interrupt execution as asynchronous.
+6. Keep CPU virtual addresses and device DMA addresses conceptually separate.
 
-7. Use correct memory ordering before notifying hardware.
+7. Treat DMA and interrupt execution as asynchronous.
 
-8. Design cleanup paths together with initialization paths.
+8. Use correct memory ordering before notifying hardware.
 
-9. Release resources in reverse acquisition order.
+9. Design cleanup paths together with initialization paths.
 
-10. Unit test hardware-independent production logic.
+10. Use dependency-safe cleanup, generally in reverse acquisition order.
 
-11. Validate hardware-dependent behavior through QEMU integration tests.
+11. Unit test hardware-independent production logic.
 
-12. Preserve runtime evidence for validated milestones.
+12. Validate hardware-dependent behavior through QEMU integration tests.
 
-13. Make implementation claims only after the corresponding behavior has been
-    demonstrated.
+13. Preserve runtime evidence for validated milestones.
+
+14. Make implementation claims only after the corresponding behavior has been
+demonstrated.
 
 
 ## Implementation Roadmap
@@ -730,12 +940,12 @@ their corresponding failure and teardown paths.
 
 ### DMA
 
-- [ ] DMA addressing configuration
-- [ ] DMA mask negotiation
-- [ ] coherent descriptor allocation
+- [x] DMA addressing configuration
+- [x] DMA mask negotiation
+- [x] coherent DMA memory allocation
 - [ ] packet-buffer DMA mapping
-- [ ] DMA ownership and lifetime management
-- [ ] DMA cleanup paths
+- [x] DMA ownership and lifetime management
+- [x] DMA cleanup paths
 
 
 ### Receive
@@ -777,9 +987,10 @@ their corresponding failure and teardown paths.
 - [x] interrupt-logic unit tests
 - [x] automated PCI/MMIO integration tests
 - [x] automated interrupt integration tests
+- [x] automated DMA-foundation integration tests
 - [x] runtime evidence for PCI/MMIO milestone
 - [x] runtime evidence for interrupt milestone
-- [ ] DMA integration tests
+- [x] runtime evidence for DMA-foundation milestone
 - [ ] descriptor-ring unit tests
 - [ ] RX validation
 - [ ] TX validation
@@ -794,6 +1005,7 @@ Development and validation currently use:
 - C
 - Linux kernel modules
 - Linux PCI subsystem
+- Linux DMA API
 - GCC
 - Make / Kbuild
 - QEMU
@@ -801,13 +1013,15 @@ Development and validation currently use:
 - Intel 82540EM / QEMU `e1000`
 - PCI
 - MMIO
+- PCI bus mastering
 - legacy INTx
+- coherent DMA memory
 - Unity C test framework
 
 Future milestones add:
 
-- DMA
 - Ethernet descriptor rings
+- packet-buffer DMA mappings
 - Linux `net_device`
 - Linux networking integration
 
@@ -824,14 +1038,24 @@ Linux mechanisms including:
 - PCI resource ownership
 - MMIO
 - PCI bus mastering
+- Linux DMA APIs
+- coherent DMA allocation
 - interrupts
-- DMA
-- descriptor rings
-- Linux networking integration
+- kernel resource cleanup
 
-The peripheral itself is emulated; the Linux driver, kernel APIs, PCI
-resource-management mechanisms, interrupt subsystem, and future DMA APIs are
-real.
+The peripheral itself is emulated.
+
+The Linux driver, kernel APIs, PCI subsystem, DMA API, MMIO APIs, interrupt
+subsystem, resource ownership, error handling, and cleanup paths are real
+Linux mechanisms.
+
+The following remain planned and are not yet claimed as implemented:
+
+- RX descriptor programming
+- TX descriptor programming
+- packet DMA
+- descriptor-ring operation
+- Linux networking integration
 
 Physical NIC validation is outside the initial project scope.
 
@@ -856,8 +1080,9 @@ After the basic RX/TX driver is operational, potential extensions include:
 
 The unit-test suite vendors Unity v2.7.0 under `third_party/unity/`.
 
-Unity is distributed under the MIT license. Its upstream license text is
-preserved in:
+Unity is distributed under the MIT license.
+
+Its upstream license text is preserved in:
 
 - `third_party/unity/LICENSE.txt`
 

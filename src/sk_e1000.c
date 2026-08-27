@@ -14,21 +14,24 @@
  *   - BAR0 MMIO mapping
  *   - CTRL and STATUS register access
  *   - PCI bus mastering
- *   - DMA address-mask negotiation
- *   - DMA-coherent descriptor memory allocation
+ *   - DMA mask negotiation
+ *   - Intel legacy RX/TX descriptor definitions
+ *   - compile-time descriptor-layout validation
+ *   - separate DMA-coherent RX/TX descriptor-ring allocation
+ *   - hardware-independent producer / consumer ring logic
  *   - legacy INTx interrupt registration
  *   - e1000 interrupt masking and cause handling
  *   - deterministic interrupt-path validation
  *   - shared hardware-independent interrupt decision logic
- *   - ordered error unwind and resource cleanup
+ *   - dependency-safe error unwind and resource cleanup
  *
  * Future milestones:
  *
- *   - Intel RX descriptor definition
- *   - Intel TX descriptor definition
- *   - DMA-backed RX descriptor ring
- *   - DMA-backed TX descriptor ring
- *   - producer / consumer management
+ *   - program Intel RX descriptor-ring registers
+ *   - program Intel TX descriptor-ring registers
+ *   - allocate and map RX packet buffers
+ *   - map TX packet buffers
+ *   - connect producer / consumer state to hardware rings
  *   - packet receive / transmit
  *   - Linux net_device integration
  *   - driver statistics
@@ -59,6 +62,7 @@
 
 #include "sk_e1000_logic.h"
 #include "sk_e1000_dma.h"
+#include "sk_e1000_desc.h"
 
 
 /*
@@ -87,38 +91,13 @@
  * through BAR0.
  *
  * BAR0 itself is located in PCI configuration space. Linux reads it,
- * allocates the physical address range, and exposes that information
+ * assigns the physical address range, and exposes that information
  * through the PCI resource APIs.
  *
  * The driver does NOT hard-code the observed QEMU BAR address.
  */
 
 #define SK_E1000_BAR                    0
-
-
-/*
- * --------------------------------------------------------------------------
- * DMA FOUNDATION
- * --------------------------------------------------------------------------
- *
- * Allocate an initial coherent memory region that will become the
- * foundation for hardware descriptor storage.
- *
- * This milestone intentionally does NOT program the address into RX/TX
- * hardware registers yet.
- *
- * Therefore:
- *
- *     coherent DMA memory exists                 YES
- *     valid device DMA address exists            YES
- *     NIC packet DMA through descriptors         NOT YET
- *
- * 4096 bytes gives the project a real persistent DMA-coherent region
- * while descriptor formats and separate RX/TX rings are introduced in
- * the next milestone.
- */
-
-#define SK_E1000_DESCRIPTOR_MEM_SIZE    4096U
 
 
 /*
@@ -205,27 +184,34 @@
  *
  * dma_bits:
  *
- *     DMA addressing width successfully negotiated with the Linux DMA
- *     subsystem.
+ *     DMA addressing width successfully negotiated with the Linux
+ *     DMA subsystem.
  *
  *     The driver first requests 64-bit DMA addressing and falls back
  *     to 32-bit addressing when necessary.
  *
  *
- * descriptor_mem:
+ * rx_desc_ring / tx_desc_ring:
  *
- *     Persistent DMA-coherent memory owned by this driver.
+ *     Independent DMA-coherent memory regions containing the RX and
+ *     TX descriptor arrays.
  *
- *     It contains two distinct address views:
+ *     Each region contains:
  *
  *         cpu_addr
- *             used by the CPU
+ *             CPU-visible kernel virtual address
  *
  *         dma_addr
- *             used by the device
+ *             device-visible DMA address
  *
- *     The DMA address will eventually be programmed into the e1000
- *     descriptor-ring registers.
+ *         size
+ *             allocation size
+ *
+ *     Each ring currently contains SK_E1000_RING_COUNT legacy
+ *     descriptors and occupies SK_E1000_RING_SIZE bytes.
+ *
+ *     Packet buffers are NOT allocated yet, and these DMA addresses
+ *     are NOT yet programmed into the NIC ring registers.
  *
  *
  * irq_test_done:
@@ -247,7 +233,8 @@ struct sk_e1000_device {
 
     unsigned int dma_bits;
 
-    struct sk_e1000_dma_region descriptor_mem;
+    struct sk_e1000_dma_region rx_desc_ring;
+    struct sk_e1000_dma_region tx_desc_ring;
 
     struct completion irq_test_done;
 
@@ -286,8 +273,9 @@ static void sk_e1000_disable_interrupts(struct sk_e1000_device *dev)
     /*
      * Writing all 1 bits to IMC clears all interrupt-enable bits.
      */
-    iowrite32(0xffffffff,
-              dev->bar0 + E1000_REG_IMC);
+    iowrite32(
+        0xffffffff,
+        dev->bar0 + E1000_REG_IMC);
 
 
     /*
@@ -296,13 +284,15 @@ static void sk_e1000_disable_interrupts(struct sk_e1000_device *dev)
      * Read STATUS so the previous write reaches the device before
      * execution proceeds.
      */
-    (void)ioread32(dev->bar0 + E1000_REG_STATUS);
+    (void)ioread32(
+        dev->bar0 + E1000_REG_STATUS);
 
 
     /*
      * Clear already-pending interrupt causes.
      */
-    (void)ioread32(dev->bar0 + E1000_REG_ICR);
+    (void)ioread32(
+        dev->bar0 + E1000_REG_ICR);
 }
 
 
@@ -326,14 +316,15 @@ static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
     struct sk_e1000_device *dev = data;
     u32 cause;
 
-
     (void)irq;
 
 
     /*
      * Read and acknowledge the Interrupt Cause Register.
      */
-    cause = ioread32(dev->bar0 + E1000_REG_ICR);
+    cause =
+        ioread32(
+            dev->bar0 + E1000_REG_ICR);
 
 
     /*
@@ -347,8 +338,9 @@ static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
     dev->last_icr = cause;
 
 
-    pr_info("sk_e1000: interrupt received ICR=0x%08x\n",
-            cause);
+    pr_info(
+        "sk_e1000: interrupt received ICR=0x%08x\n",
+        cause);
 
 
     /*
@@ -358,7 +350,8 @@ static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
      */
     if (sk_e1000_irq_has_lsc(cause)) {
 
-        pr_info("sk_e1000: LSC interrupt handled\n");
+        pr_info(
+            "sk_e1000: LSC interrupt handled\n");
 
 
         /*
@@ -372,7 +365,8 @@ static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
          *        ->
          *     this ISR
          */
-        complete(&dev->irq_test_done);
+        complete(
+            &dev->irq_test_done);
     }
 
 
@@ -399,11 +393,14 @@ static irqreturn_t sk_e1000_irq_handler(int irq, void *data)
  *          ->
  *     BAR0 MMIO mapping
  *          ->
- *     coherent DMA memory
+ *     RX descriptor-ring DMA allocation
+ *          ->
+ *     TX descriptor-ring DMA allocation
  *          ->
  *     IRQ registration
  *
- * Failure handling releases owned resources in reverse order.
+ * Failure handling releases only successfully acquired resources,
+ * generally in reverse acquisition order.
  */
 
 static int sk_e1000_probe(struct pci_dev *pdev,
@@ -436,9 +433,10 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      */
 
-    pr_info("sk_e1000: matched PCI device %04x:%04x\n",
-            pdev->vendor,
-            pdev->device);
+    pr_info(
+        "sk_e1000: matched PCI device %04x:%04x\n",
+        pdev->vendor,
+        pdev->device);
 
 
     /*
@@ -447,12 +445,16 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      */
 
-    ret = pci_enable_device_mem(pdev);
+    ret =
+        pci_enable_device_mem(
+            pdev);
+
 
     if (ret) {
 
-        pr_err("sk_e1000: pci_enable_device_mem failed: %d\n",
-               ret);
+        pr_err(
+            "sk_e1000: pci_enable_device_mem failed: %d\n",
+            ret);
 
         return ret;
     }
@@ -467,7 +469,8 @@ static int sk_e1000_probe(struct pci_dev *pdev,
     if (!(pci_resource_flags(pdev, SK_E1000_BAR) &
           IORESOURCE_MEM)) {
 
-        pr_err("sk_e1000: BAR0 is not an MMIO resource\n");
+        pr_err(
+            "sk_e1000: BAR0 is not an MMIO resource\n");
 
         ret = -ENODEV;
 
@@ -484,13 +487,15 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * system memory.
      *
      * This capability is required before the device can participate
-     * in the future RX/TX DMA datapath.
+     * in the RX/TX DMA datapath.
      */
 
-    pci_set_master(pdev);
+    pci_set_master(
+        pdev);
 
 
-    pr_info("sk_e1000: PCI bus mastering enabled\n");
+    pr_info(
+        "sk_e1000: PCI bus mastering enabled\n");
 
 
     /*
@@ -537,7 +542,9 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      */
 
-    pci_intx(pdev, 1);
+    pci_intx(
+        pdev,
+        1);
 
 
     /*
@@ -559,11 +566,13 @@ static int sk_e1000_probe(struct pci_dev *pdev,
             SK_E1000_BAR);
 
 
-    pr_info("sk_e1000: BAR0 physical start=0x%llx\n",
-            (unsigned long long)bar_start);
+    pr_info(
+        "sk_e1000: BAR0 physical start=0x%llx\n",
+        (unsigned long long)bar_start);
 
-    pr_info("sk_e1000: BAR0 size=%llu bytes\n",
-            (unsigned long long)bar_len);
+    pr_info(
+        "sk_e1000: BAR0 size=%llu bytes\n",
+        (unsigned long long)bar_len);
 
 
     /*
@@ -581,8 +590,9 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
     if (ret) {
 
-        pr_err("sk_e1000: failed to claim BAR0: %d\n",
-               ret);
+        pr_err(
+            "sk_e1000: failed to claim BAR0: %d\n",
+            ret);
 
         goto err_clear_master;
     }
@@ -629,7 +639,8 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
     if (!dev->bar0) {
 
-        pr_err("sk_e1000: failed to map BAR0\n");
+        pr_err(
+            "sk_e1000: failed to map BAR0\n");
 
         ret = -ENOMEM;
 
@@ -654,41 +665,48 @@ static int sk_e1000_probe(struct pci_dev *pdev,
             E1000_REG_STATUS);
 
 
-    pr_info("sk_e1000: CTRL   = 0x%08x\n",
-            ctrl);
+    pr_info(
+        "sk_e1000: CTRL   = 0x%08x\n",
+        ctrl);
 
-    pr_info("sk_e1000: STATUS = 0x%08x\n",
-            status);
+    pr_info(
+        "sk_e1000: STATUS = 0x%08x\n",
+        status);
 
 
-    pr_info("sk_e1000: PCI/MMIO initialization PASSED\n");
+    pr_info(
+        "sk_e1000: PCI/MMIO initialization PASSED\n");
 
 
     /*
      * ------------------------------------------------------------------
-     * ALLOCATE DMA-COHERENT DESCRIPTOR MEMORY
+     * ALLOCATE RX DESCRIPTOR RING
      * ------------------------------------------------------------------
      *
-     * The allocation persists for the lifetime of the driver.
+     * The RX ring is DMA-coherent because both CPU and NIC will access
+     * descriptor contents asynchronously.
      *
-     * The CPU receives a normal kernel virtual address while the NIC
-     * receives a separate DMA address generated by the Linux DMA API.
+     * SK_E1000_RING_SIZE currently represents:
      *
-     * The device address is NOT programmed into ring registers yet.
-     * That occurs when real RX/TX descriptor rings are introduced.
+     *     64 descriptors * 16 bytes = 1024 bytes
+     *
+     * Only descriptor memory is allocated here.
+     *
+     * RX packet buffers and hardware ring programming are introduced
+     * in later milestones.
      */
 
     ret =
         sk_e1000_dma_alloc(
             pdev,
-            &dev->descriptor_mem,
-            SK_E1000_DESCRIPTOR_MEM_SIZE);
+            &dev->rx_desc_ring,
+            SK_E1000_RING_SIZE);
 
 
     if (ret) {
 
         pr_err(
-            "sk_e1000: coherent DMA allocation failed: %d\n",
+            "sk_e1000: RX descriptor-ring DMA allocation failed: %d\n",
             ret);
 
         goto err_unmap_bar;
@@ -696,23 +714,65 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
 
     pr_info(
-        "sk_e1000: coherent DMA memory allocated size=%zu bytes\n",
-        dev->descriptor_mem.size);
+        "sk_e1000: RX descriptor ring allocated count=%u size=%zu bytes\n",
+        SK_E1000_RING_COUNT,
+        dev->rx_desc_ring.size);
 
 
     /*
      * %pad is the Linux kernel formatter for dma_addr_t.
      *
-     * We report the device-visible address as runtime evidence but
-     * never assume or hard-code its numerical value.
+     * The address is runtime evidence only. It must never be
+     * hard-coded or treated as a CPU virtual address.
      */
 
     pr_info(
-        "sk_e1000: coherent DMA address=%pad\n",
-        &dev->descriptor_mem.dma_addr);
+        "sk_e1000: RX descriptor ring DMA address=%pad\n",
+        &dev->rx_desc_ring.dma_addr);
 
 
-    pr_info("sk_e1000: DMA foundation PASSED\n");
+    /*
+     * ------------------------------------------------------------------
+     * ALLOCATE TX DESCRIPTOR RING
+     * ------------------------------------------------------------------
+     *
+     * RX and TX are independent hardware queues and therefore own
+     * separate coherent descriptor-ring allocations.
+     *
+     * TX packet mappings and hardware ring programming are not
+     * introduced yet.
+     */
+
+    ret =
+        sk_e1000_dma_alloc(
+            pdev,
+            &dev->tx_desc_ring,
+            SK_E1000_RING_SIZE);
+
+
+    if (ret) {
+
+        pr_err(
+            "sk_e1000: TX descriptor-ring DMA allocation failed: %d\n",
+            ret);
+
+        goto err_free_rx_ring;
+    }
+
+
+    pr_info(
+        "sk_e1000: TX descriptor ring allocated count=%u size=%zu bytes\n",
+        SK_E1000_RING_COUNT,
+        dev->tx_desc_ring.size);
+
+
+    pr_info(
+        "sk_e1000: TX descriptor ring DMA address=%pad\n",
+        &dev->tx_desc_ring.dma_addr);
+
+
+    pr_info(
+        "sk_e1000: RX/TX descriptor-ring DMA allocation PASSED\n");
 
 
     /*
@@ -721,10 +781,13 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * ------------------------------------------------------------------
      */
 
-    sk_e1000_disable_interrupts(dev);
+    sk_e1000_disable_interrupts(
+        dev);
 
 
-    init_completion(&dev->irq_test_done);
+    init_completion(
+        &dev->irq_test_done);
+
 
     dev->last_icr = 0;
 
@@ -746,16 +809,18 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
     if (ret) {
 
-        pr_err("sk_e1000: request_irq(%u) failed: %d\n",
-               pdev->irq,
-               ret);
+        pr_err(
+            "sk_e1000: request_irq(%u) failed: %d\n",
+            pdev->irq,
+            ret);
 
-        goto err_free_dma;
+        goto err_free_tx_ring;
     }
 
 
-    pr_info("sk_e1000: IRQ handler registered on IRQ %u\n",
-            pdev->irq);
+    pr_info(
+        "sk_e1000: IRQ handler registered on IRQ %u\n",
+        pdev->irq);
 
 
     /*
@@ -801,7 +866,8 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      *     sk_e1000_irq_handler()
      */
 
-    pr_info("sk_e1000: triggering LSC interrupt test\n");
+    pr_info(
+        "sk_e1000: triggering LSC interrupt test\n");
 
 
     iowrite32(
@@ -827,8 +893,8 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      * This completion exists only for deterministic bring-up
      * validation.
      *
-     * Future RX/TX packet processing will remain asynchronous and will
-     * not wait synchronously for every DMA operation.
+     * Future RX/TX packet processing remains asynchronous and will
+     * not synchronously wait for each DMA operation.
      */
 
     completed =
@@ -840,7 +906,8 @@ static int sk_e1000_probe(struct pci_dev *pdev,
 
     if (!completed) {
 
-        pr_err("sk_e1000: interrupt test timed out\n");
+        pr_err(
+            "sk_e1000: interrupt test timed out\n");
 
         ret = -ETIMEDOUT;
 
@@ -864,17 +931,19 @@ static int sk_e1000_probe(struct pci_dev *pdev,
     }
 
 
-    pr_info("sk_e1000: interrupt test PASSED\n");
+    pr_info(
+        "sk_e1000: interrupt test PASSED\n");
 
 
     /*
      * The deterministic interrupt test is complete.
      *
-     * Keep normal interrupts masked until RX/TX datapath
-     * initialization is implemented.
+     * Keep normal interrupts masked until the RX/TX datapath is
+     * initialized.
      */
 
-    sk_e1000_disable_interrupts(dev);
+    sk_e1000_disable_interrupts(
+        dev);
 
 
     /*
@@ -901,7 +970,9 @@ static int sk_e1000_probe(struct pci_dev *pdev,
      *      ->
      * MMIO mapping
      *      ->
-     * coherent DMA allocation
+     * RX descriptor-ring DMA allocation
+     *      ->
+     * TX descriptor-ring DMA allocation
      *      ->
      * IRQ registration
      *      ->
@@ -922,17 +993,21 @@ static int sk_e1000_probe(struct pci_dev *pdev,
  * ERROR UNWIND
  * --------------------------------------------------------------------------
  *
- * Resources are released in reverse acquisition order.
+ * Each label represents an ownership boundary.
+ *
+ * Resources are released only if the corresponding acquisition step
+ * succeeded.
  */
 
 
 err_free_irq:
 
     /*
-     * Stop hardware interrupt generation before removing the ISR.
+     * Stop device interrupt generation before removing the ISR.
      */
 
-    sk_e1000_disable_interrupts(dev);
+    sk_e1000_disable_interrupts(
+        dev);
 
 
     free_irq(
@@ -940,16 +1015,26 @@ err_free_irq:
         dev);
 
 
-/*
- * The IRQ is now gone, so DMA memory can no longer become reachable
- * from future interrupt handling.
- */
+    /*
+     * IRQ teardown is complete.
+     *
+     * TX was allocated after RX, so descriptor-ring memory is released
+     * in reverse allocation order.
+     */
 
-err_free_dma:
+
+err_free_tx_ring:
 
     sk_e1000_dma_free(
         pdev,
-        &dev->descriptor_mem);
+        &dev->tx_desc_ring);
+
+
+err_free_rx_ring:
+
+    sk_e1000_dma_free(
+        pdev,
+        &dev->rx_desc_ring);
 
 
 err_unmap_bar:
@@ -961,7 +1046,8 @@ err_unmap_bar:
 
 err_free_dev:
 
-    kfree(dev);
+    kfree(
+        dev);
 
 
 err_release_region:
@@ -973,12 +1059,14 @@ err_release_region:
 
 err_clear_master:
 
-    pci_clear_master(pdev);
+    pci_clear_master(
+        pdev);
 
 
 err_disable_device:
 
-    pci_disable_device(pdev);
+    pci_disable_device(
+        pdev);
 
 
     return ret;
@@ -990,13 +1078,15 @@ err_disable_device:
  * DRIVER REMOVE
  * --------------------------------------------------------------------------
  *
- * Current teardown order:
+ * Current dependency-safe teardown order:
  *
  *     mask NIC interrupts
  *          ->
  *     free Linux IRQ
  *          ->
- *     free coherent DMA memory
+ *     free TX descriptor-ring DMA memory
+ *          ->
+ *     free RX descriptor-ring DMA memory
  *          ->
  *     unmap BAR0
  *          ->
@@ -1008,8 +1098,9 @@ err_disable_device:
  *          ->
  *     disable PCI device
  *
- * IRQ teardown occurs before DMA/MMIO teardown because the ISR may
- * eventually consume descriptor state and already accesses BAR0.
+ * IRQ teardown occurs before DMA/MMIO teardown because the ISR already
+ * accesses BAR0 and future packet-processing versions will also consume
+ * descriptor state.
  */
 
 static void sk_e1000_remove(struct pci_dev *pdev)
@@ -1017,7 +1108,9 @@ static void sk_e1000_remove(struct pci_dev *pdev)
     struct sk_e1000_device *dev;
 
 
-    dev = pci_get_drvdata(pdev);
+    dev =
+        pci_get_drvdata(
+            pdev);
 
 
     if (dev) {
@@ -1026,14 +1119,15 @@ static void sk_e1000_remove(struct pci_dev *pdev)
          * Prevent new device interrupts before removing the handler.
          */
 
-        sk_e1000_disable_interrupts(dev);
+        sk_e1000_disable_interrupts(
+            dev);
 
 
         /*
          * The ISR accesses BAR0 and future versions will access
          * descriptor state.
          *
-         * Remove it before freeing either resource.
+         * Remove it before destroying either resource.
          */
 
         free_irq(
@@ -1042,18 +1136,29 @@ static void sk_e1000_remove(struct pci_dev *pdev)
 
 
         /*
-         * Release DMA-coherent memory while the PCI device is still
-         * enabled and associated with the same DMA API context used
-         * during allocation.
+         * Release TX first because it was allocated after RX.
+         *
+         * DMA memory is released while the PCI device remains enabled
+         * and associated with the same DMA API context used during
+         * allocation.
          */
 
         sk_e1000_dma_free(
             pdev,
-            &dev->descriptor_mem);
+            &dev->tx_desc_ring);
 
 
         pr_info(
-            "sk_e1000: coherent DMA memory released\n");
+            "sk_e1000: TX descriptor ring DMA memory released\n");
+
+
+        sk_e1000_dma_free(
+            pdev,
+            &dev->rx_desc_ring);
+
+
+        pr_info(
+            "sk_e1000: RX descriptor ring DMA memory released\n");
 
 
         /*
@@ -1069,10 +1174,21 @@ static void sk_e1000_remove(struct pci_dev *pdev)
 
 
         /*
+         * Prevent stale access through PCI driver data before releasing
+         * the private structure.
+         */
+
+        pci_set_drvdata(
+            pdev,
+            NULL);
+
+
+        /*
          * Release driver-private kernel memory.
          */
 
-        kfree(dev);
+        kfree(
+            dev);
     }
 
 
@@ -1080,7 +1196,8 @@ static void sk_e1000_remove(struct pci_dev *pdev)
      * Disable the device's ability to initiate PCI transactions.
      */
 
-    pci_clear_master(pdev);
+    pci_clear_master(
+        pdev);
 
 
     /*
@@ -1096,7 +1213,8 @@ static void sk_e1000_remove(struct pci_dev *pdev)
      * Disable PCI memory resources enabled during probe().
      */
 
-    pci_disable_device(pdev);
+    pci_disable_device(
+        pdev);
 
 
     pr_info(

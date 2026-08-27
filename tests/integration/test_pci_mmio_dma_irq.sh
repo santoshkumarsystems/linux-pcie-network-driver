@@ -18,20 +18,22 @@
 #   - MMIO register access
 #   - PCI bus mastering
 #   - DMA addressing configuration
-#   - coherent DMA memory allocation
-#   - DMA address creation
+#   - independent RX descriptor-ring DMA allocation
+#   - independent TX descriptor-ring DMA allocation
+#   - RX/TX device-visible DMA address creation
 #   - legacy INTx interrupt registration
 #   - e1000 interrupt generation through ICS
 #   - interrupt delivery through Linux
 #   - ICR cause handling
 #   - Link Status Change interrupt handling
-#   - coherent DMA release
+#   - TX descriptor-ring DMA release
+#   - RX descriptor-ring DMA release
 #   - IRQ release
 #   - PCI bus-master cleanup
 #   - PCI device release
 #
-# Hardware-independent decision logic is tested separately with
-# Unity under tests/unit/.
+# Hardware-independent interrupt and ring-management logic is tested
+# separately with Unity under tests/unit/.
 #
 # Author: Santosh Kumar
 #
@@ -51,7 +53,20 @@ EXPECTED_DEVICE="0x100e"
 DRIVER_NAME="sk_e1000"
 STOCK_DRIVER="e1000"
 
-EXPECTED_DMA_SIZE="4096"
+
+# Intel 82540EM legacy RX/TX descriptor-ring geometry.
+#
+# Each legacy descriptor is 16 bytes and this driver currently owns
+# 64 descriptors per ring:
+#
+#     64 * 16 = 1024 bytes
+#
+# RX and TX use independent DMA-coherent descriptor-ring allocations.
+#
+
+EXPECTED_RING_COUNT="64"
+EXPECTED_RING_SIZE="1024"
+
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -149,7 +164,7 @@ trap cleanup EXIT
 # -----------------------------------------------------------------------------
 
 printf '%s\n' "========================================================"
-printf '%s\n' " sk_e1000 PCI/MMIO/DMA/IRQ Integration Test"
+printf '%s\n' " sk_e1000 PCI/MMIO/DMA/Ring/IRQ Integration Test"
 printf '%s\n' "========================================================"
 printf '\n'
 
@@ -175,13 +190,16 @@ pass "PCI device ${PCI_DEVICE} exists"
 ACTUAL_VENDOR="$(cat "${SYSFS_DEVICE}/vendor")"
 ACTUAL_DEVICE="$(cat "${SYSFS_DEVICE}/device")"
 
+
 if [[ "${ACTUAL_VENDOR}" != "${EXPECTED_VENDOR}" ]]; then
     fail "unexpected PCI Vendor ID: ${ACTUAL_VENDOR}"
 fi
 
+
 if [[ "${ACTUAL_DEVICE}" != "${EXPECTED_DEVICE}" ]]; then
     fail "unexpected PCI Device ID: ${ACTUAL_DEVICE}"
 fi
+
 
 pass "PCI identity is ${EXPECTED_VENDOR}:${EXPECTED_DEVICE}"
 
@@ -212,6 +230,7 @@ fi
 
 ORIGINAL_DRIVER="$(current_driver)"
 
+
 case "${ORIGINAL_DRIVER}" in
 
     "")
@@ -232,6 +251,7 @@ if [[ -n "$(current_driver)" ]]; then
     fail "PCI device could not be released for testing"
 fi
 
+
 pass "PCI device available for custom driver"
 
 
@@ -248,9 +268,11 @@ sudo dmesg -C
 
 sudo insmod "${MODULE_PATH}"
 
+
 if ! lsmod | grep -q "^${DRIVER_NAME}[[:space:]]"; then
     fail "sk_e1000 module did not load"
 fi
+
 
 pass "sk_e1000 module loaded"
 
@@ -261,9 +283,11 @@ pass "sk_e1000 module loaded"
 
 BOUND_DRIVER="$(current_driver)"
 
+
 if [[ "${BOUND_DRIVER}" != "${DRIVER_NAME}" ]]; then
     fail "PCI device is owned by '${BOUND_DRIVER}', expected sk_e1000"
 fi
+
 
 pass "sk_e1000 owns ${PCI_DEVICE}"
 
@@ -278,6 +302,7 @@ if ! sudo dmesg |
     fail "PCI ID match log not found"
 fi
 
+
 pass "PCI ID match verified"
 
 
@@ -291,11 +316,13 @@ if ! sudo dmesg |
     fail "BAR0 physical address log not found"
 fi
 
+
 if ! sudo dmesg |
     grep -q "sk_e1000: BAR0 size="; then
 
     fail "BAR0 size log not found"
 fi
+
 
 pass "BAR0 discovery verified"
 
@@ -310,6 +337,7 @@ if ! sudo dmesg |
     fail "CTRL MMIO read log not found"
 fi
 
+
 pass "CTRL register MMIO read verified"
 
 
@@ -322,6 +350,7 @@ if ! sudo dmesg |
 
     fail "STATUS MMIO read log not found"
 fi
+
 
 pass "STATUS register MMIO read verified"
 
@@ -336,6 +365,7 @@ if ! sudo dmesg |
     fail "PCI/MMIO initialization success log not found"
 fi
 
+
 pass "PCI/MMIO initialization completed"
 
 
@@ -349,6 +379,7 @@ if ! sudo dmesg |
     fail "PCI bus-master initialization log not found"
 fi
 
+
 pass "PCI bus-master initialization verified"
 
 
@@ -361,6 +392,7 @@ if ! sudo lspci -vv -s "${PCI_DEVICE#0000:}" |
 
     fail "PCI Bus Master bit is not enabled"
 fi
+
 
 pass "PCI COMMAND register reports BusMaster+"
 
@@ -394,64 +426,116 @@ case "${DMA_BITS}" in
 
 esac
 
+
 pass "DMA addressing configured (${DMA_BITS}-bit)"
 
 
 # -----------------------------------------------------------------------------
-# 17. Verify coherent DMA allocation size
+# 17. Verify RX descriptor-ring geometry
 # -----------------------------------------------------------------------------
+#
+# The driver owns one DMA-coherent RX descriptor ring containing the
+# configured number of Intel legacy receive descriptors.
+#
 
 if ! sudo dmesg |
     grep -q \
-    "sk_e1000: coherent DMA memory allocated size=${EXPECTED_DMA_SIZE} bytes"; then
+    "sk_e1000: RX descriptor ring allocated count=${EXPECTED_RING_COUNT} size=${EXPECTED_RING_SIZE} bytes"; then
 
-    fail "expected coherent DMA allocation log not found"
+    fail "expected RX descriptor-ring allocation log not found"
 fi
 
-pass "Coherent DMA allocation size verified (${EXPECTED_DMA_SIZE} bytes)"
+
+pass \
+    "RX descriptor ring verified (${EXPECTED_RING_COUNT} descriptors, ${EXPECTED_RING_SIZE} bytes)"
 
 
 # -----------------------------------------------------------------------------
-# 18. Verify a device-visible DMA address was produced
+# 18. Verify RX device-visible DMA address
 # -----------------------------------------------------------------------------
 #
 # A DMA address is not assumed to equal the CPU virtual address.
 #
-# DMA address zero can be valid on some platforms, so this test checks
-# that Linux supplied and the driver logged an address rather than
-# imposing a non-zero requirement.
+# DMA address zero can be valid on some platforms, so this test verifies
+# that Linux supplied and the driver logged an address without imposing
+# a non-zero requirement.
 #
 
-DMA_ADDRESS="$(
+RX_DMA_ADDRESS="$(
     sudo dmesg |
     sed -n \
-        's/.*sk_e1000: coherent DMA address=\(0x[0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' |
+        's/.*sk_e1000: RX descriptor ring DMA address=\(0x[0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' |
     tail -n 1
 )"
 
 
-if [[ -z "${DMA_ADDRESS}" ]]; then
-    fail "coherent DMA address log not found"
+if [[ -z "${RX_DMA_ADDRESS}" ]]; then
+    fail "RX descriptor-ring DMA address log not found"
 fi
 
-pass "Device-visible DMA address recorded (${DMA_ADDRESS})"
+
+pass \
+    "RX device-visible DMA address recorded (${RX_DMA_ADDRESS})"
 
 
 # -----------------------------------------------------------------------------
-# 19. Verify DMA foundation milestone
+# 19. Verify TX descriptor-ring geometry
+# -----------------------------------------------------------------------------
+#
+# TX owns a separate DMA-coherent descriptor ring rather than sharing
+# the receive descriptor allocation.
+#
+
+if ! sudo dmesg |
+    grep -q \
+    "sk_e1000: TX descriptor ring allocated count=${EXPECTED_RING_COUNT} size=${EXPECTED_RING_SIZE} bytes"; then
+
+    fail "expected TX descriptor-ring allocation log not found"
+fi
+
+
+pass \
+    "TX descriptor ring verified (${EXPECTED_RING_COUNT} descriptors, ${EXPECTED_RING_SIZE} bytes)"
+
+
+# -----------------------------------------------------------------------------
+# 20. Verify TX device-visible DMA address
+# -----------------------------------------------------------------------------
+
+TX_DMA_ADDRESS="$(
+    sudo dmesg |
+    sed -n \
+        's/.*sk_e1000: TX descriptor ring DMA address=\(0x[0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' |
+    tail -n 1
+)"
+
+
+if [[ -z "${TX_DMA_ADDRESS}" ]]; then
+    fail "TX descriptor-ring DMA address log not found"
+fi
+
+
+pass \
+    "TX device-visible DMA address recorded (${TX_DMA_ADDRESS})"
+
+
+# -----------------------------------------------------------------------------
+# 21. Verify descriptor-ring DMA initialization milestone
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
-    grep -q "sk_e1000: DMA foundation PASSED"; then
+    grep -q \
+    "sk_e1000: RX/TX descriptor-ring DMA allocation PASSED"; then
 
-    fail "DMA foundation validation log not found"
+    fail "RX/TX descriptor-ring DMA initialization log not found"
 fi
 
-pass "DMA foundation initialization completed"
+
+pass "RX/TX descriptor-ring DMA initialization completed"
 
 
 # -----------------------------------------------------------------------------
-# 20. Verify Linux IRQ handler registration
+# 22. Verify Linux IRQ handler registration
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -460,15 +544,17 @@ if ! sudo dmesg |
     fail "IRQ registration log not found"
 fi
 
+
 if ! grep -q "${DRIVER_NAME}" /proc/interrupts; then
     fail "sk_e1000 not present in /proc/interrupts"
 fi
+
 
 pass "Linux IRQ handler registration verified"
 
 
 # -----------------------------------------------------------------------------
-# 21. Verify deterministic hardware interrupt trigger
+# 23. Verify deterministic hardware interrupt trigger
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -477,11 +563,12 @@ if ! sudo dmesg |
     fail "LSC interrupt trigger log not found"
 fi
 
+
 pass "e1000 LSC interrupt trigger verified"
 
 
 # -----------------------------------------------------------------------------
-# 22. Verify interrupt reached ISR
+# 24. Verify interrupt reached ISR
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -490,11 +577,12 @@ if ! sudo dmesg |
     fail "expected ICR interrupt cause was not observed"
 fi
 
+
 pass "ISR received expected ICR=0x00000004"
 
 
 # -----------------------------------------------------------------------------
-# 23. Verify Link Status Change handling
+# 25. Verify Link Status Change handling
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -503,11 +591,12 @@ if ! sudo dmesg |
     fail "LSC interrupt handling log not found"
 fi
 
+
 pass "Link Status Change interrupt handled"
 
 
 # -----------------------------------------------------------------------------
-# 24. Verify interrupt synchronization completed
+# 26. Verify interrupt synchronization completed
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -516,11 +605,12 @@ if ! sudo dmesg |
     fail "interrupt completion validation did not pass"
 fi
 
+
 pass "Interrupt delivery validation completed"
 
 
 # -----------------------------------------------------------------------------
-# 25. Verify complete initialization
+# 27. Verify complete initialization
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -530,72 +620,99 @@ if ! sudo dmesg |
     fail "complete DMA/IRQ initialization success log not found"
 fi
 
+
 pass "PCI/MMIO/DMA/IRQ initialization completed"
 
 
 # -----------------------------------------------------------------------------
-# 26. Unload driver and exercise remove()
+# 28. Unload driver and exercise remove()
 # -----------------------------------------------------------------------------
 
 sudo rmmod "${DRIVER_NAME}"
+
 
 if lsmod | grep -q "^${DRIVER_NAME}[[:space:]]"; then
     fail "sk_e1000 module remains loaded after rmmod"
 fi
 
+
 pass "sk_e1000 module unloaded"
 
 
 # -----------------------------------------------------------------------------
-# 27. Verify coherent DMA resource release
+# 29. Verify TX descriptor-ring DMA release
 # -----------------------------------------------------------------------------
+#
+# TX was allocated after RX and therefore is released first.
+#
 
 if ! sudo dmesg |
-    grep -q "sk_e1000: coherent DMA memory released"; then
+    grep -q \
+    "sk_e1000: TX descriptor ring DMA memory released"; then
 
-    fail "coherent DMA cleanup log not found"
+    fail "TX descriptor-ring DMA cleanup log not found"
 fi
 
-pass "Coherent DMA memory released"
+
+pass "TX descriptor-ring DMA memory released"
 
 
 # -----------------------------------------------------------------------------
-# 28. Verify complete driver cleanup path
+# 30. Verify RX descriptor-ring DMA release
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
-    grep -q "sk_e1000: device removed and resources released"; then
+    grep -q \
+    "sk_e1000: RX descriptor ring DMA memory released"; then
+
+    fail "RX descriptor-ring DMA cleanup log not found"
+fi
+
+
+pass "RX descriptor-ring DMA memory released"
+
+
+# -----------------------------------------------------------------------------
+# 31. Verify complete driver cleanup path
+# -----------------------------------------------------------------------------
+
+if ! sudo dmesg |
+    grep -q \
+    "sk_e1000: device removed and resources released"; then
 
     fail "driver cleanup log not found"
 fi
+
 
 pass "Driver cleanup path verified"
 
 
 # -----------------------------------------------------------------------------
-# 29. Verify IRQ registration was released
+# 32. Verify IRQ registration was released
 # -----------------------------------------------------------------------------
 
 if grep -q "${DRIVER_NAME}" /proc/interrupts; then
     fail "sk_e1000 IRQ remains registered after module unload"
 fi
 
+
 pass "IRQ handler released"
 
 
 # -----------------------------------------------------------------------------
-# 30. Verify custom driver released PCI device
+# 33. Verify custom driver released PCI device
 # -----------------------------------------------------------------------------
 
 if [[ "$(current_driver)" == "${DRIVER_NAME}" ]]; then
     fail "sk_e1000 still owns PCI device after unload"
 fi
 
+
 pass "PCI device released by sk_e1000"
 
 
 # -----------------------------------------------------------------------------
-# 31. Verify PCI bus mastering was cleared
+# 34. Verify PCI bus mastering was cleared
 # -----------------------------------------------------------------------------
 #
 # Perform this before the EXIT trap potentially restores the stock e1000
@@ -608,6 +725,7 @@ if ! sudo lspci -vv -s "${PCI_DEVICE#0000:}" |
     fail "PCI Bus Master bit remains enabled after driver removal"
 fi
 
+
 pass "PCI COMMAND register reports BusMaster- after cleanup"
 
 
@@ -617,6 +735,6 @@ pass "PCI COMMAND register reports BusMaster- after cleanup"
 
 printf '\n'
 printf '%s\n' "========================================================"
-printf ' ALL %d PCI/MMIO/DMA/IRQ INTEGRATION CHECKS PASSED\n' \
+printf ' ALL %d PCI/MMIO/DMA/RING/IRQ INTEGRATION CHECKS PASSED\n' \
     "${TESTS_RUN}"
 printf '%s\n' "========================================================"

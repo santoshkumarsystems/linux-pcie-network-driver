@@ -1,10 +1,8 @@
 # Linux PCI Network Driver
 
-A Linux kernel network-driver project for a QEMU-emulated Intel 82540EM
-Gigabit Ethernet Controller.
+A Linux kernel network-driver project for a QEMU-emulated Intel 82540EM Gigabit Ethernet Controller.
 
-The project is being built to demonstrate low-level hardware/software
-interaction through:
+The project demonstrates low-level hardware/software interaction through:
 
 - PCI device discovery
 - Base Address Registers (BARs)
@@ -12,7 +10,9 @@ interaction through:
 - PCI bus mastering
 - hardware interrupts
 - Direct Memory Access (DMA)
-- descriptor rings
+- Intel RX/TX descriptor formats
+- DMA-backed descriptor-ring memory
+- producer / consumer ring management
 - Receive (RX) and Transmit (TX) packet processing
 - Linux networking integration
 
@@ -25,18 +25,13 @@ The current hardware target is the QEMU `e1000` device:
 
 The Intel 82540EM uses a conventional PCI system interface.
 
-The Linux PCI driver mechanisms demonstrated here—resource discovery, MMIO,
-bus mastering, interrupts, DMA, ownership, ordering, and cleanup—are also
-fundamental to PCIe device drivers.
-
+The Linux PCI driver mechanisms demonstrated here—resource discovery, MMIO, bus mastering, interrupts, DMA, ownership, ordering, and cleanup—are also fundamental to PCIe device drivers.
 
 ## Use Case
 
-Embedded Linux systems frequently communicate with high-performance
-peripherals through PCI-family buses.
+Embedded Linux systems frequently communicate with high-performance peripherals through PCI-family buses.
 
-An Ethernet Network Interface Card (NIC) provides a practical systems
-programming target because a single device combines:
+An Ethernet Network Interface Card (NIC) provides a practical systems-programming target because a single device combines:
 
 - PCI device discovery
 - Base Address Registers (BARs)
@@ -50,10 +45,7 @@ programming target because a single device combines:
 - Linux kernel resource management
 - Linux networking integration
 
-The goal is to build one coherent driver that eventually moves Ethernet
-frames between Linux and a dedicated QEMU-emulated NIC while exposing the
-hardware/software contract clearly.
-
+The goal is to build one coherent driver that eventually moves Ethernet frames between Linux and a dedicated QEMU-emulated NIC while exposing the hardware/software contract clearly.
 
 ## Why This Project
 
@@ -70,9 +62,7 @@ The broader systems problem is:
 
 **How does Linux safely and efficiently communicate with hardware?**
 
-This project focuses on that boundary rather than reimplementing networking
-functionality already provided by the Linux kernel.
-
+This project focuses on that boundary rather than reimplementing networking functionality already provided by the Linux kernel.
 
 ## Hardware / VM Architecture
 
@@ -87,25 +77,37 @@ The QEMU virtual machine uses two network devices.
               Virtio                   Intel e1000
                  |                       82540EM
                  |                          |
-        Linux virtio driver         sk_e1000 driver
+        Linux virtio driver          sk_e1000 driver
                  |                          |
-          SSH / management              PCI resources
+          SSH / management             PCI resources
                                          BAR0 / MMIO
                                          bus mastering
                                          interrupts
-                                         DMA foundation
-                                              |
-                                              v
-                                      Planned RX/TX rings
-                                              |
-                                              v
-                                      Planned networking
+                                         DMA addressing
+                                             |
+                           +-----------------+-----------------+
+                           |                                   |
+                           v                                   v
+                  RX descriptor ring                  TX descriptor ring
+                  64 x 16-byte descriptors            64 x 16-byte descriptors
+                  1024-byte coherent DMA              1024-byte coherent DMA
+                           |                                   |
+                           +---------------+-------------------+
+                                           |
+                                           v
+                                 Hardware ring registers
+                                      NOT YET PROGRAMMED
+                                           |
+                                           v
+                                     Packet buffers
+                                      NOT YET MAPPED
+                                           |
+                                           v
+                                  Linux networking path
+                                      NOT YET WIRED
 ```
 
-The Virtio NIC remains controlled by the standard Linux driver so management
-and SSH connectivity are not interrupted while the custom driver takes
-ownership of the dedicated Intel 82540EM device.
-
+The Virtio NIC remains controlled by the standard Linux driver so management and SSH connectivity are not interrupted while the custom driver takes ownership of the dedicated Intel 82540EM device.
 
 ## Current Driver Initialization
 
@@ -152,11 +154,18 @@ Map BAR0 into kernel virtual address space
 Read CTRL and STATUS through MMIO
         |
         v
-Allocate coherent DMA memory
+Allocate RX descriptor-ring coherent DMA memory
         |
-        +--> CPU virtual address
+        +--> 64 descriptors
+        +--> 16 bytes per descriptor
+        +--> 1024 bytes total
         |
-        +--> device-visible DMA address
+        v
+Allocate TX descriptor-ring coherent DMA memory
+        |
+        +--> 64 descriptors
+        +--> 16 bytes per descriptor
+        +--> 1024 bytes total
         |
         v
 Mask / clear stale interrupt causes
@@ -189,36 +198,15 @@ Validate Link Status Change cause
 PCI/MMIO/DMA/IRQ initialization PASS
 ```
 
-The DMA allocation established in the current milestone is persistent coherent
-memory owned by the driver.
+The current milestone establishes real RX and TX descriptor memory, but the NIC is not yet consuming those rings.
 
-Linux provides two address views for the same allocation:
-
-```text
-CPU                         NIC
- |                           |
- v                           v
-cpu_addr                  dma_addr
-   \                         /
-    \                       /
-     +---- same memory ----+
-```
-
-The CPU virtual address is used by kernel code.
-
-The DMA address is the device-visible address that may later be programmed
-into NIC descriptor-ring registers.
-
-The current driver does **not** yet program RX or TX descriptor rings and does
-not claim packet DMA functionality.
-
+The driver does **not** yet program the RX/TX descriptor-ring base, length, head, or tail registers, does not map packet buffers, and does not claim packet DMA functionality.
 
 ## MMIO
 
 MMIO = Memory-Mapped I/O.
 
-The driver discovers BAR0 dynamically through the Linux PCI subsystem and
-maps it using the kernel PCI/MMIO APIs.
+The driver discovers BAR0 dynamically through the Linux PCI subsystem and maps it using the kernel PCI/MMIO APIs.
 
 The physical BAR address is never hard-coded.
 
@@ -240,16 +228,15 @@ iowrite32()
 
 rather than normal memory dereferences.
 
+RX/TX descriptor-ring registers are a future hardware-programming milestone.
 
-## DMA Foundation
+## DMA and Descriptor-Ring Foundation
 
 DMA = Direct Memory Access.
 
-DMA allows a device to access system memory without requiring the CPU to copy
-every byte between the device and RAM.
+DMA allows a device to access system memory without requiring the CPU to copy every byte between the device and RAM.
 
-Before using DMA, the driver must establish which DMA addresses the platform
-can safely provide to the device.
+Before using DMA, the driver must establish which DMA addresses the platform can safely provide to the device.
 
 The current driver performs:
 
@@ -278,47 +265,110 @@ dma_alloc_coherent()
 dma_free_coherent()
 ```
 
-The driver never assumes that a CPU virtual address can be directly supplied
-to the NIC.
+The driver never assumes that a CPU virtual address can be directly supplied to the NIC.
 
-A coherent DMA allocation provides:
+Each coherent allocation has two address views:
 
 ```text
-               one memory allocation
-                       |
-           +-----------+-----------+
-           |                       |
-           v                       v
-      CPU address              DMA address
-      cpu_addr                 dma_addr
-           |                       |
-           |                       |
-        CPU access               NIC access
+                  one coherent allocation
+                           |
+              +------------+------------+
+              |                         |
+              v                         v
+         CPU address               DMA address
+          cpu_addr                  dma_addr
+              |                         |
+              |                         |
+          CPU access                 NIC access
 ```
 
-The current milestone allocates a 4096-byte coherent DMA region.
+The current driver allocates two independent coherent DMA regions:
 
-That region establishes:
+```text
+RX descriptor ring
+    64 descriptors x 16 bytes
+    = 1024 bytes coherent DMA
+
+TX descriptor ring
+    64 descriptors x 16 bytes
+    = 1024 bytes coherent DMA
+```
+
+Each ring is owned for the lifetime of the driver instance and released during dependency-safe teardown.
+
+This milestone establishes:
 
 - DMA mask negotiation
 - coherent DMA allocation
 - explicit CPU/device address separation
+- independent RX and TX descriptor memory
 - DMA ownership
 - DMA lifetime tracking
 - DMA cleanup
 
 It does **not** yet establish:
 
-- Intel RX descriptor structures
-- Intel TX descriptor structures
-- RX descriptor-ring programming
-- TX descriptor-ring programming
-- packet-buffer DMA mappings
+- RX/TX ring-register programming
+- RX packet-buffer DMA mappings
+- TX packet-buffer DMA mappings
 - actual packet receive DMA
 - actual packet transmit DMA
 
-Those are separate future milestones.
+## Intel Descriptor Formats
 
+The project now defines the Intel 82540EM legacy receive and transmit descriptor layouts in `include/sk_e1000_desc.h`.
+
+Current descriptor contract:
+
+```text
+Legacy RX descriptor size: 16 bytes
+Legacy TX descriptor size: 16 bytes
+Descriptor count per ring:  64
+Ring size:                  1024 bytes
+```
+
+Compile-time assertions verify that the C structures remain 16 bytes and that the selected ring size satisfies the configured ring-length granularity.
+
+The descriptor definitions are present and compiled into the kernel module, but descriptor contents are not yet connected to packet buffers or handed to hardware.
+
+## Descriptor-Ring Management Logic
+
+Hardware-independent circular-ring logic is implemented in:
+
+```text
+include/sk_e1000_ring.h
+src/sk_e1000_ring.c
+```
+
+The current logic covers:
+
+- advancing to the next descriptor index
+- wraparound
+- empty detection
+- full detection
+- one-slot guard semantics
+- used-descriptor accounting
+- free-descriptor accounting
+- defensive handling of invalid indexes and small ring sizes
+
+The implementation uses producer / consumer terminology.
+
+```text
+producer
+   |
+   | software advances as work is queued
+   v
++-----+-----+-----+-----+-----+
+|  0  |  1  |  2  |  3  | ... |
++-----+-----+-----+-----+-----+
+   ^
+   |
+consumer
+```
+
+This logic is compiled into the production kernel module and is also tested directly in user space through Unity.
+
+It is **not yet wired to the Intel RX/TX hardware head/tail registers**. That integration is a separate milestone because hardware ownership rules must be introduced deliberately rather than inferred from generic circular-queue behavior.
 
 ## Interrupt Handling
 
@@ -367,45 +417,52 @@ Interrupt validation PASS
 
 ISR = Interrupt Service Routine.
 
-The completion object currently used during `probe()` is a bring-up validation
-mechanism.
+The completion object currently used during `probe()` is a bring-up validation mechanism.
 
 It is not intended to serialize the future RX/TX packet datapath.
 
-
 ## Shared Production Logic
 
-Hardware-independent interrupt decision logic is separated from kernel and
-MMIO operations.
+Hardware-independent logic is separated from kernel/MMIO/DMA operations so the same production implementation can be compiled into the kernel module and exercised directly by user-space tests.
+
+Current shared logic is organized as:
 
 ```text
-                  include/sk_e1000_logic.h
-                           |
-                           v
-                   src/sk_e1000_logic.c
-                      /             \
-                     /               \
-                    v                 v
-            src/sk_e1000.c      Unity unit tests
-            kernel driver
+Interrupt logic
+
+include/sk_e1000_logic.h
+          |
+          v
+src/sk_e1000_logic.c
+      /           \
+     /             \
+    v               v
+kernel module    Unity tests
+
+
+Ring logic
+
+include/sk_e1000_ring.h
+          |
+          v
+src/sk_e1000_ring.c
+      /           \
+     /             \
+    v               v
+kernel module    Unity tests
 ```
 
-The same implementation is therefore:
-
-- linked into the production kernel module
-- directly exercised by user-space unit tests
-
-This avoids duplicating production logic inside the test suite.
-
-Current shared logic validates:
+Current shared production logic covers:
 
 - whether an Interrupt Cause Register value represents a pending interrupt
 - whether Link Status Change is present
 - correct handling of multiple simultaneous interrupt-cause bits
+- circular-ring index advancement
+- wraparound
+- full / empty detection
+- used / free descriptor accounting
 
-Future shared production logic will also contain suitable
-hardware-independent descriptor-ring operations.
-
+This avoids duplicating production logic inside the test suite.
 
 ## Planned Receive Path
 
@@ -436,8 +493,9 @@ driver consumes descriptor
 Linux networking stack
 ```
 
-The Receive path is not yet implemented.
+The RX descriptor format and coherent descriptor-ring memory now exist.
 
+The remaining RX datapath—packet buffers, hardware register programming, descriptor ownership transitions, receive completion, and Linux packet delivery—is not yet implemented.
 
 ## Planned Transmit Path
 
@@ -471,32 +529,13 @@ NIC transmits Ethernet frame
 Network
 ```
 
-The Transmit path is not yet implemented.
+The TX descriptor format and coherent descriptor-ring memory now exist.
 
-
-## Descriptor Rings
-
-The future RX and TX paths will use circular descriptor rings shared between
-the driver and NIC.
-
-Correct ring operation requires explicit management of:
-
-- producer position
-- consumer position
-- ring wraparound
-- descriptor ownership
-- DMA buffer lifetime
-- full and empty conditions
-- hardware completion
-- memory ordering
-
-A descriptor must never be reused while hardware still owns it.
-
+The remaining TX datapath—packet mapping, hardware register programming, descriptor submission, completion, and reclamation—is not yet implemented.
 
 ## Linux Networking Boundary
 
-The NIC driver is responsible for moving Ethernet frames between Linux and
-the hardware.
+The NIC driver is responsible for moving Ethernet frames between Linux and the hardware.
 
 Higher-level networking functionality remains in the Linux networking stack.
 
@@ -518,9 +557,7 @@ DMA descriptor rings
 NIC
 ```
 
-The project does not reimplement TCP/IP functionality already provided by
-Linux.
-
+The project does not reimplement TCP/IP functionality already provided by Linux.
 
 ## Project Structure
 
@@ -535,10 +572,13 @@ linux-pcie-network-driver/
 |   +-- sk_e1000.c
 |   +-- sk_e1000_logic.c
 |   +-- sk_e1000_dma.c
+|   +-- sk_e1000_ring.c
 |
 +-- include/
 |   +-- sk_e1000_logic.h
 |   +-- sk_e1000_dma.h
+|   +-- sk_e1000_desc.h
+|   +-- sk_e1000_ring.h
 |
 +-- docs/
 |   +-- hardware-target.md
@@ -550,11 +590,14 @@ linux-pcie-network-driver/
 |       +-- pci-mmio-irq-dmesg.txt
 |       +-- pci-mmio-dma-irq-integration.txt
 |       +-- pci-mmio-dma-irq-dmesg.txt
+|       +-- descriptor-ring-integration.txt
+|       +-- descriptor-ring-dmesg.txt
 |       +-- irq-logic-unit-tests.txt
 |
 +-- tests/
 |   +-- unit/
 |   |   +-- test_irq_logic.c
+|   |   +-- test_ring_logic.c
 |   |
 |   +-- integration/
 |       +-- test_pci_mmio_dma_irq.sh
@@ -570,33 +613,28 @@ linux-pcie-network-driver/
 +-- scripts/
 ```
 
-Generated kernel-module and user-space unit-test artifacts are excluded from
-source control.
-
+Generated kernel-module and user-space unit-test artifacts are excluded from source control.
 
 ## Testing Strategy
 
-The project separates hardware-independent logic from hardware-dependent
-validation.
-
+The project separates hardware-independent logic from hardware-dependent validation.
 
 ### Unit Tests
 
 User-space unit tests use the Unity C test framework.
 
-The tests compile the same production implementation contained in:
+The tests compile the same production implementations contained in:
 
 ```text
 src/sk_e1000_logic.c
+src/sk_e1000_ring.c
 ```
 
-No PCI device, MMIO implementation, interrupt controller, DMA subsystem, or
-QEMU hardware is mocked.
+No PCI device, MMIO implementation, interrupt controller, DMA subsystem, or QEMU hardware is mocked.
 
-Hardware-dependent DMA behavior is validated through integration testing
-against Linux and the QEMU e1000 device.
+Hardware-dependent behavior is validated through integration testing against Linux and the QEMU e1000 device.
 
-Current unit coverage:
+Current interrupt-logic coverage includes:
 
 - zero interrupt cause
 - Link Status Change interrupt cause
@@ -608,40 +646,50 @@ Current unit coverage:
 - LSC detected when multiple causes are present
 - LSC detected across the full 32-bit cause mask
 
+Current ring-logic coverage includes:
+
+- normal index advancement
+- last-slot wraparound
+- zero-sized ring handling
+- empty / non-empty state
+- full detection
+- wraparound full detection
+- one-slot guard capacity
+- out-of-range producer / consumer handling
+- used-descriptor accounting
+- free-descriptor accounting
+- full-ring free-space behavior
+
 Current result:
 
 ```text
+IRQ logic:
 9 Tests
 0 Failures
 0 Ignored
-OK
+
+Ring logic:
+19 Tests
+0 Failures
+0 Ignored
+
+Total:
+28 Tests
+0 Failures
+0 Ignored
 ```
-
-Future hardware-independent unit coverage will include:
-
-- producer / consumer ring behavior
-- ring wraparound
-- full / empty detection
-- descriptor index calculations
-- register-bit helpers
-- packet and buffer boundary helpers
-
 
 ### Kernel-Specific Tests
 
-Kernel-specific helper logic may use KUnit where doing so provides meaningful
-coverage.
+Kernel-specific helper logic may use KUnit where doing so provides meaningful coverage.
 
 KUnit will not be added simply to increase test count.
 
-Hardware behavior that is better validated against the actual QEMU device
-remains an integration-test responsibility.
-
+Hardware behavior that is better validated against the actual QEMU device remains an integration-test responsibility.
 
 ### Integration Tests
 
-The integration suite operates against the QEMU-emulated Intel 82540EM and
-the real Linux PCI, DMA, MMIO, and interrupt subsystems.
+The integration suite operates against the QEMU-emulated Intel 82540EM and the real Linux PCI, DMA, MMIO, and interrupt subsystems.
 
 Current automated validation includes:
 
@@ -661,9 +709,11 @@ Current automated validation includes:
 - PCI `BusMaster+` state
 - DMA addressing configuration
 - 64-bit or 32-bit DMA negotiation validation
-- coherent DMA allocation size
-- device-visible DMA address creation
-- DMA foundation initialization
+- RX descriptor-ring geometry: 64 descriptors / 1024 bytes
+- RX device-visible DMA address creation
+- TX descriptor-ring geometry: 64 descriptors / 1024 bytes
+- TX device-visible DMA address creation
+- RX/TX descriptor-ring DMA initialization
 - Linux IRQ handler registration
 - e1000 LSC interrupt generation
 - ISR execution
@@ -672,7 +722,8 @@ Current automated validation includes:
 - interrupt completion validation
 - complete PCI/MMIO/DMA/IRQ initialization
 - module unload
-- coherent DMA memory release
+- TX descriptor-ring DMA release
+- RX descriptor-ring DMA release
 - driver cleanup
 - IRQ handler release
 - PCI device release
@@ -681,16 +732,14 @@ Current automated validation includes:
 Current result:
 
 ```text
-29 integration checks
-29 passed
+32 integration checks
+32 passed
 0 failed
 ```
 
-
 ## Current Status
 
-The driver currently implements and validates the PCI/MMIO/DMA/IRQ bring-up
-path against a QEMU-emulated Intel 82540EM (`8086:100e`).
+The driver currently implements and validates the PCI/MMIO/interrupt/DMA descriptor-ring foundation against a QEMU-emulated Intel 82540EM (`8086:100e`).
 
 Implemented functionality:
 
@@ -706,9 +755,15 @@ Implemented functionality:
 - PCI bus mastering
 - DMA addressing configuration
 - 64-bit DMA negotiation with 32-bit fallback
-- coherent DMA memory allocation
+- Intel legacy RX descriptor definition
+- Intel legacy TX descriptor definition
+- compile-time descriptor-size validation
+- separate RX descriptor-ring coherent DMA allocation
+- separate TX descriptor-ring coherent DMA allocation
 - CPU virtual address and DMA address separation
 - DMA ownership and lifetime tracking
+- hardware-independent producer / consumer ring logic
+- ring wraparound / full / empty / used / free accounting
 - DMA cleanup
 - legacy INTx registration
 - interrupt masking
@@ -716,8 +771,9 @@ Implemented functionality:
 - interrupt acknowledgement
 - deterministic hardware-model interrupt generation
 - shared interrupt decision logic
-- ordered error unwind
+- dependency-safe error unwind
 - IRQ teardown
+- RX/TX descriptor-ring teardown
 - BAR/MMIO teardown
 - PCI bus-master cleanup
 - PCI resource release
@@ -727,15 +783,14 @@ Implemented functionality:
 
 Not yet implemented:
 
-- Intel RX descriptors
-- Intel TX descriptors
-- RX descriptor ring
-- TX descriptor ring
-- packet-buffer DMA mappings
+- RX descriptor-ring register programming
+- TX descriptor-ring register programming
+- RX packet-buffer DMA mappings
+- TX packet-buffer DMA mappings
+- hardware RX/TX producer / consumer integration
 - packet receive
 - packet transmit
 - Linux `net_device` integration
-
 
 ### Observed Test Environment
 
@@ -751,61 +806,65 @@ CTRL:                    0x40140240
 STATUS:                  0x80080783
 Test ICR:                0x00000004
 DMA addressing:          64-bit
-Coherent DMA allocation: 4096 bytes
+RX descriptor count:     64
+RX descriptor size:      16 bytes
+RX ring allocation:      1024 bytes
+TX descriptor count:     64
+TX descriptor size:      16 bytes
+TX ring allocation:      1024 bytes
 ```
 
 These values are runtime observations, not hard-coded driver assumptions.
 
-The coherent DMA address itself is intentionally not documented as a fixed
-value because it is dynamically assigned and may differ between runs.
-
+DMA addresses are intentionally not documented as fixed values because they are dynamically assigned and may differ between runs.
 
 ## Runtime Evidence
 
-Validation output is committed so implemented claims can be traced to actual
-test runs.
+Validation output is committed so implemented claims can be traced to actual test runs.
 
-
-### Current PCI/MMIO/DMA/IRQ Milestone
+### Current Descriptor-Ring DMA Milestone
 
 QEMU integration-test result:
 
-- [`docs/evidence/pci-mmio-dma-irq-integration.txt`](docs/evidence/pci-mmio-dma-irq-integration.txt)
+- [`docs/evidence/descriptor-ring-integration.txt`](docs/evidence/descriptor-ring-integration.txt)
 
 Kernel driver log:
 
-- [`docs/evidence/pci-mmio-dma-irq-dmesg.txt`](docs/evidence/pci-mmio-dma-irq-dmesg.txt)
+- [`docs/evidence/descriptor-ring-dmesg.txt`](docs/evidence/descriptor-ring-dmesg.txt)
 
 Integration-test source:
 
 - [`tests/integration/test_pci_mmio_dma_irq.sh`](tests/integration/test_pci_mmio_dma_irq.sh)
 
-Unity unit-test result:
+Ring unit-test source:
 
-- [`docs/evidence/irq-logic-unit-tests.txt`](docs/evidence/irq-logic-unit-tests.txt)
+- [`tests/unit/test_ring_logic.c`](tests/unit/test_ring_logic.c)
 
-Unit-test source:
+Interrupt unit-test source:
 
 - [`tests/unit/test_irq_logic.c`](tests/unit/test_irq_logic.c)
 
+### Previous PCI/MMIO/DMA/IRQ Milestone
+
+The earlier generic DMA-foundation milestone remains available as development-history evidence:
+
+- [`docs/evidence/pci-mmio-dma-irq-integration.txt`](docs/evidence/pci-mmio-dma-irq-integration.txt)
+- [`docs/evidence/pci-mmio-dma-irq-dmesg.txt`](docs/evidence/pci-mmio-dma-irq-dmesg.txt)
+- [`docs/evidence/irq-logic-unit-tests.txt`](docs/evidence/irq-logic-unit-tests.txt)
 
 ### Previous PCI/MMIO/IRQ Milestone
 
-The earlier interrupt milestone remains available as development-history
-evidence:
+The earlier interrupt milestone remains available as development-history evidence:
 
 - [`docs/evidence/pci-mmio-irq-integration.txt`](docs/evidence/pci-mmio-irq-integration.txt)
 - [`docs/evidence/pci-mmio-irq-dmesg.txt`](docs/evidence/pci-mmio-irq-dmesg.txt)
 
-
 ### Previous PCI/MMIO Milestone
 
-The original PCI/MMIO milestone remains available as development-history
-evidence:
+The original PCI/MMIO milestone remains available as development-history evidence:
 
 - [`docs/evidence/pci-mmio-integration.txt`](docs/evidence/pci-mmio-integration.txt)
 - [`docs/evidence/pci-mmio-dmesg.txt`](docs/evidence/pci-mmio-dmesg.txt)
-
 
 ## Error Handling and Resource Ownership
 
@@ -832,14 +891,16 @@ driver-private memory
 BAR0 MMIO mapping
         |
         v
-coherent DMA allocation
+RX descriptor-ring coherent DMA allocation
+        |
+        v
+TX descriptor-ring coherent DMA allocation
         |
         v
 IRQ registration
 ```
 
-Cleanup is dependency-safe and generally releases resources in reverse
-acquisition order.
+Cleanup is dependency-safe and generally releases resources in reverse acquisition order.
 
 Current remove path:
 
@@ -850,7 +911,10 @@ mask device interrupts
 free Linux IRQ
         |
         v
-free coherent DMA memory
+free TX descriptor-ring DMA memory
+        |
+        v
+free RX descriptor-ring DMA memory
         |
         v
 unmap BAR0
@@ -868,48 +932,47 @@ release BAR0
 disable PCI device
 ```
 
-The IRQ handler is released before DMA and MMIO resources are destroyed
-because the ISR currently accesses BAR0 and future versions may consume
-descriptor state.
+The IRQ handler is released before DMA and MMIO resources are destroyed because the ISR already accesses BAR0 and future packet-processing versions will also consume descriptor state.
 
-The coherent DMA allocation is released while the PCI device and its DMA API
-context are still valid.
+The TX ring is released before the RX ring because TX is allocated after RX.
 
-Error paths use the same ownership model so partially initialized devices
-release only resources that were successfully acquired.
+The DMA allocations are released while the PCI device and its DMA API context are still valid.
 
+Error paths follow explicit ownership boundaries:
+
+```text
+RX allocation failure
+    -> unmap BAR0
+
+TX allocation failure
+    -> free RX ring
+    -> unmap BAR0
+
+IRQ registration / later probe failure
+    -> free IRQ when registered
+    -> free TX ring
+    -> free RX ring
+    -> unmap BAR0
+```
+
+Partially initialized devices therefore release only resources that were successfully acquired.
 
 ## Design Principles
 
 1. Follow the actual NIC hardware specification.
-
 2. Do not invent register layouts or descriptor formats.
-
 3. Discover platform-assigned resources dynamically.
-
 4. Keep hardware-specific operations separate from reusable pure logic.
-
 5. Make CPU and NIC ownership explicit.
-
 6. Keep CPU virtual addresses and device DMA addresses conceptually separate.
-
 7. Treat DMA and interrupt execution as asynchronous.
-
 8. Use correct memory ordering before notifying hardware.
-
 9. Design cleanup paths together with initialization paths.
-
 10. Use dependency-safe cleanup, generally in reverse acquisition order.
-
 11. Unit test hardware-independent production logic.
-
 12. Validate hardware-dependent behavior through QEMU integration tests.
-
 13. Preserve runtime evidence for validated milestones.
-
-14. Make implementation claims only after the corresponding behavior has been
-demonstrated.
-
+14. Make implementation claims only after the corresponding behavior has been demonstrated.
 
 ## Implementation Roadmap
 
@@ -924,7 +987,6 @@ demonstrated.
 - [x] CTRL register access
 - [x] STATUS register access
 
-
 ### Bus Mastering / Interrupts
 
 - [x] PCI bus mastering
@@ -937,39 +999,54 @@ demonstrated.
 - [x] IRQ teardown
 - [x] PCI bus-master cleanup
 
-
 ### DMA
 
 - [x] DMA addressing configuration
 - [x] DMA mask negotiation
-- [x] coherent DMA memory allocation
-- [ ] packet-buffer DMA mapping
+- [x] coherent DMA allocation helper
+- [x] independent RX descriptor-ring DMA allocation
+- [x] independent TX descriptor-ring DMA allocation
 - [x] DMA ownership and lifetime management
 - [x] DMA cleanup paths
+- [ ] RX packet-buffer DMA mapping
+- [ ] TX packet-buffer DMA mapping
 
+### Descriptor Rings
+
+- [x] Intel legacy RX descriptor definition
+- [x] Intel legacy TX descriptor definition
+- [x] compile-time descriptor-size validation
+- [x] fixed descriptor-ring geometry
+- [x] producer / consumer ring helpers
+- [x] ring wraparound logic
+- [x] full / empty detection
+- [x] used / free descriptor accounting
+- [x] ring-logic unit tests
+- [x] coherent RX descriptor-ring memory
+- [x] coherent TX descriptor-ring memory
+- [ ] program RX ring base / length / head / tail registers
+- [ ] program TX ring base / length / head / tail registers
+- [ ] connect software ring state to hardware ownership
 
 ### Receive
 
-- [ ] RX descriptor definition
-- [ ] RX descriptor ring
-- [ ] RX DMA buffers
-- [ ] producer / consumer management
+- [ ] RX packet buffers
+- [ ] RX buffer DMA mapping
 - [ ] RX hardware configuration
+- [ ] RX descriptor ownership transitions
 - [ ] receive completion
+- [ ] descriptor replenishment
 - [ ] packet delivery to Linux
-
 
 ### Transmit
 
-- [ ] TX descriptor definition
-- [ ] TX descriptor ring
-- [ ] TX DMA mapping
-- [ ] producer / consumer management
+- [ ] TX packet DMA mapping
 - [ ] TX hardware configuration
+- [ ] TX descriptor submission
+- [ ] memory ordering before hardware notification
 - [ ] TX hardware notification
 - [ ] transmit completion
 - [ ] descriptor reclamation
-
 
 ### Linux Networking
 
@@ -980,23 +1057,25 @@ demonstrated.
 - [ ] MAC configuration
 - [ ] driver statistics
 
-
 ### Validation
 
 - [x] Unity unit-test framework
 - [x] interrupt-logic unit tests
+- [x] descriptor-ring logic unit tests
 - [x] automated PCI/MMIO integration tests
 - [x] automated interrupt integration tests
 - [x] automated DMA-foundation integration tests
+- [x] automated descriptor-ring DMA integration tests
 - [x] runtime evidence for PCI/MMIO milestone
 - [x] runtime evidence for interrupt milestone
 - [x] runtime evidence for DMA-foundation milestone
-- [ ] descriptor-ring unit tests
-- [ ] RX validation
-- [ ] TX validation
+- [x] runtime evidence for descriptor-ring DMA milestone
+- [ ] RX register-programming validation
+- [ ] TX register-programming validation
+- [ ] packet RX validation
+- [ ] packet TX validation
 - [ ] bidirectional network traffic
 - [ ] runtime packet statistics
-
 
 ## Environment
 
@@ -1016,22 +1095,22 @@ Development and validation currently use:
 - PCI bus mastering
 - legacy INTx
 - coherent DMA memory
+- Intel legacy RX/TX descriptors
+- producer / consumer ring logic
 - Unity C test framework
 
 Future milestones add:
 
-- Ethernet descriptor rings
+- RX/TX ring-register programming
 - packet-buffer DMA mappings
 - Linux `net_device`
 - Linux networking integration
-
 
 ## Scope
 
 The initial hardware target is the QEMU-emulated Intel 82540EM.
 
-QEMU provides a reproducible development environment while exercising real
-Linux mechanisms including:
+QEMU provides a reproducible development environment while exercising real Linux mechanisms including:
 
 - PCI enumeration
 - kernel driver matching and binding
@@ -1045,20 +1124,20 @@ Linux mechanisms including:
 
 The peripheral itself is emulated.
 
-The Linux driver, kernel APIs, PCI subsystem, DMA API, MMIO APIs, interrupt
-subsystem, resource ownership, error handling, and cleanup paths are real
-Linux mechanisms.
+The Linux driver, kernel APIs, PCI subsystem, DMA API, MMIO APIs, interrupt subsystem, resource ownership, error handling, and cleanup paths are real Linux mechanisms.
+
+The project currently demonstrates real Linux allocation and lifetime management of RX/TX descriptor-ring memory, but it does **not** yet claim that the Intel 82540EM hardware is consuming those rings.
 
 The following remain planned and are not yet claimed as implemented:
 
-- RX descriptor programming
-- TX descriptor programming
-- packet DMA
-- descriptor-ring operation
+- RX descriptor-ring register programming
+- TX descriptor-ring register programming
+- packet-buffer DMA
+- hardware descriptor ownership transitions
+- packet receive / transmit
 - Linux networking integration
 
 Physical NIC validation is outside the initial project scope.
-
 
 ## Future Work
 
@@ -1075,7 +1154,6 @@ After the basic RX/TX driver is operational, potential extensions include:
 - fault-injection testing
 - physical NIC validation
 
-
 ## Third-Party Software
 
 The unit-test suite vendors Unity v2.7.0 under `third_party/unity/`.
@@ -1086,7 +1164,6 @@ Its upstream license text is preserved in:
 
 - `third_party/unity/LICENSE.txt`
 
-
 ## License
 
 The kernel module currently declares:
@@ -1095,5 +1172,4 @@ The kernel module currently declares:
 MODULE_LICENSE("GPL");
 ```
 
-A repository-level license file should be added before treating the project
-license as finalized.
+A repository-level license file should be added before treating the project license as finalized.

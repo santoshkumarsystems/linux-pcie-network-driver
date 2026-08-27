@@ -1,0 +1,40 @@
+========================================================
+ sk_e1000 PCI/MMIO/DMA/Ring/IRQ Integration Test
+========================================================
+
+[PASS] PCI device 0000:00:04.0 exists
+[PASS] PCI identity is 0x8086:0x100e
+[PASS] Kernel module exists
+[PASS] PCI device available for custom driver
+[PASS] sk_e1000 module loaded
+[PASS] sk_e1000 owns 0000:00:04.0
+[PASS] PCI ID match verified
+[PASS] BAR0 discovery verified
+[PASS] CTRL register MMIO read verified
+[PASS] STATUS register MMIO read verified
+[PASS] PCI/MMIO initialization completed
+[PASS] PCI bus-master initialization verified
+[PASS] PCI COMMAND register reports BusMaster+
+[PASS] DMA addressing configured (64-bit)
+[PASS] RX descriptor ring verified (64 descriptors, 1024 bytes)
+[PASS] RX device-visible DMA address recorded (0x0000000026476000)
+[PASS] TX descriptor ring verified (64 descriptors, 1024 bytes)
+[PASS] TX device-visible DMA address recorded (0x0000000032c36000)
+[PASS] RX/TX descriptor-ring DMA initialization completed
+[PASS] Linux IRQ handler registration verified
+[PASS] e1000 LSC interrupt trigger verified
+[PASS] ISR received expected ICR=0x00000004
+[PASS] Link Status Change interrupt handled
+[PASS] Interrupt delivery validation completed
+[PASS] PCI/MMIO/DMA/IRQ initialization completed
+[PASS] sk_e1000 module unloaded
+[PASS] TX descriptor-ring DMA memory released
+[PASS] RX descriptor-ring DMA memory released
+[PASS] Driver cleanup path verified
+[PASS] IRQ handler released
+[PASS] PCI device released by sk_e1000
+[PASS] PCI COMMAND register reports BusMaster- after cleanup
+
+========================================================
+ ALL 32 PCI/MMIO/DMA/RING/IRQ INTEGRATION CHECKS PASSED
+========================================================

@@ -13,10 +13,10 @@
 #       Build the Linux kernel module.
 #
 #   make unit-test
-#       Build and execute Unity-based unit tests in user space.
+#       Build and execute all Unity-based unit tests in user space.
 #
 #   make unit-test-build
-#       Build the unit-test executable without running it.
+#       Build all unit-test executables without running them.
 #
 #   make clean
 #       Remove kernel-module and unit-test build artifacts.
@@ -53,10 +53,16 @@ obj-m += sk_e1000.o
 #         Linux DMA API integration, DMA mask negotiation,
 #         coherent allocation, and DMA resource cleanup.
 #
+#     src/sk_e1000_ring.c
+#         Hardware-independent descriptor-ring index and
+#         producer/consumer accounting logic shared with
+#         user-space unit tests.
+#
 sk_e1000-objs := \
 	src/sk_e1000.o \
 	src/sk_e1000_logic.o \
-	src/sk_e1000_dma.o
+	src/sk_e1000_dma.o \
+	src/sk_e1000_ring.o
 
 
 #
@@ -65,10 +71,12 @@ sk_e1000-objs := \
 # $(src) is provided by Kbuild and identifies the root directory
 # of this external kernel-module source tree.
 #
-# This allows source files to use:
+# This allows source files to use project headers such as:
 #
 #     #include "sk_e1000_logic.h"
 #     #include "sk_e1000_dma.h"
+#     #include "sk_e1000_desc.h"
+#     #include "sk_e1000_ring.h"
 #
 ccflags-y += -I$(src)/include
 
@@ -93,14 +101,16 @@ PWD := $(shell pwd)
 # Unit tests run outside the kernel and exercise pure,
 # hardware-independent production logic.
 #
-# The same src/sk_e1000_logic.c implementation is linked into:
+# Production implementations are shared directly with the kernel module:
 #
-#     1. sk_e1000.ko
-#     2. the Unity unit-test executable
+#     src/sk_e1000_logic.c
+#         interrupt decision logic
 #
-# Linux DMA API operations are intentionally not mocked here.
-# DMA allocation and cleanup are validated through QEMU integration
-# tests against the real Linux DMA subsystem.
+#     src/sk_e1000_ring.c
+#         producer/consumer ring mathematics
+#
+# Linux PCI, MMIO, interrupt, and DMA APIs are intentionally not mocked.
+# Hardware-dependent behavior is validated through QEMU integration tests.
 #
 
 UNIT_CC := gcc
@@ -108,19 +118,41 @@ UNIT_CC := gcc
 UNITY_DIR := third_party/unity/src
 UNIT_BUILD_DIR := build/tests
 
-UNIT_TEST_BIN := $(UNIT_BUILD_DIR)/test_irq_logic
 
-UNIT_TEST_SRCS := \
+#
+# Individual Unity test executables.
+#
+IRQ_TEST_BIN := $(UNIT_BUILD_DIR)/test_irq_logic
+RING_TEST_BIN := $(UNIT_BUILD_DIR)/test_ring_logic
+
+UNIT_TEST_BINS := \
+	$(IRQ_TEST_BIN) \
+	$(RING_TEST_BIN)
+
+
+#
+# IRQ unit-test sources.
+#
+IRQ_TEST_SRCS := \
 	tests/unit/test_irq_logic.c \
 	src/sk_e1000_logic.c \
 	$(UNITY_DIR)/unity.c
 
 
 #
+# Descriptor-ring unit-test sources.
+#
+RING_TEST_SRCS := \
+	tests/unit/test_ring_logic.c \
+	src/sk_e1000_ring.c \
+	$(UNITY_DIR)/unity.c
+
+
+#
 # Compiler diagnostics for project-owned unit-test code.
 #
-# -MMD and -MP generate dependency files so changes to included
-# headers automatically rebuild the test executable.
+# -MMD and -MP generate dependency information so changes to included
+# project headers cause the corresponding test executable to rebuild.
 #
 UNIT_CFLAGS := \
 	-std=c11 \
@@ -163,7 +195,7 @@ module:
 
 
 #
-# Build and execute the Unity unit tests.
+# Build and execute all Unity unit tests.
 #
 # These tests do not require:
 #
@@ -173,18 +205,34 @@ module:
 #     - Linux kernel headers
 #
 unit-test: unit-test-build
-	./$(UNIT_TEST_BIN)
+	@echo
+	@echo "=== IRQ LOGIC UNIT TESTS ==="
+	./$(IRQ_TEST_BIN)
+	@echo
+	@echo "=== RING LOGIC UNIT TESTS ==="
+	./$(RING_TEST_BIN)
 
 
 #
-# Build the Unity unit-test executable.
+# Build all Unity unit-test executables.
 #
-unit-test-build: $(UNIT_TEST_BIN)
+unit-test-build: $(UNIT_TEST_BINS)
 
 
-$(UNIT_TEST_BIN): $(UNIT_TEST_SRCS) include/sk_e1000_logic.h
+#
+# IRQ decision-logic test executable.
+#
+$(IRQ_TEST_BIN): $(IRQ_TEST_SRCS) include/sk_e1000_logic.h
 	@mkdir -p $(UNIT_BUILD_DIR)
-	$(UNIT_CC) $(UNIT_CFLAGS) $(UNIT_TEST_SRCS) -o $@
+	$(UNIT_CC) $(UNIT_CFLAGS) $(IRQ_TEST_SRCS) -o $@
+
+
+#
+# Descriptor-ring producer/consumer test executable.
+#
+$(RING_TEST_BIN): $(RING_TEST_SRCS) include/sk_e1000_ring.h
+	@mkdir -p $(UNIT_BUILD_DIR)
+	$(UNIT_CC) $(UNIT_CFLAGS) $(RING_TEST_SRCS) -o $@
 
 
 # ============================================================================

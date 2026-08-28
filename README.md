@@ -2,7 +2,7 @@
 
 A Linux kernel network-driver project for a QEMU-emulated Intel 82540EM Gigabit Ethernet Controller.
 
-The project demonstrates low-level hardware/software interaction through:
+The project is built incrementally around low-level hardware/software interaction through:
 
 - PCI device discovery
 - Base Address Registers (BARs)
@@ -11,10 +11,12 @@ The project demonstrates low-level hardware/software interaction through:
 - hardware interrupts
 - Direct Memory Access (DMA)
 - Intel RX/TX descriptor formats
-- DMA-backed descriptor-ring memory
+- DMA-backed RX/TX descriptor-ring memory
+- Intel descriptor-ring base/length MMIO programming
+- descriptor-register readback validation
 - producer / consumer ring management
-- Receive (RX) and Transmit (TX) packet processing
-- Linux networking integration
+- planned Receive (RX) and Transmit (TX) packet processing
+- planned Linux networking integration
 
 The current hardware target is the QEMU `e1000` device:
 
@@ -26,6 +28,33 @@ The current hardware target is the QEMU `e1000` device:
 The Intel 82540EM uses a conventional PCI system interface.
 
 The Linux PCI driver mechanisms demonstrated here—resource discovery, MMIO, bus mastering, interrupts, DMA, ownership, ordering, and cleanup—are also fundamental to PCIe device drivers.
+
+## Current Validated Checkpoint
+
+The current public checkpoint implements and validates:
+
+- Linux PCI match / `probe()` / `remove()` lifecycle
+- BAR0 discovery, ownership, and MMIO mapping
+- PCI bus mastering
+- legacy shared INTx interrupt handling
+- 64-bit DMA negotiation with 32-bit fallback
+- Intel 82540EM legacy RX/TX descriptor definitions
+- separate 64-entry RX and TX coherent-DMA descriptor rings
+- hardware-independent producer / consumer ring logic
+- RX descriptor-ring base/length programming through `RDBAL/RDBAH/RDLEN`
+- TX descriptor-ring base/length programming through `TDBAL/TDBAH/TDLEN`
+- MMIO readback validation against the runtime DMA addresses
+- explicit verification that `RCTL.EN` and `TCTL.EN` remain clear
+- dependency-safe unwind and teardown
+
+Current automated results:
+
+```text
+Unity unit tests:          28 / 28 passed
+QEMU integration checks:  35 / 35 passed
+```
+
+This checkpoint intentionally stops before `RDH/RDT/TDH/TDT` ownership initialization, packet-buffer DMA, packet-engine enablement, and Linux `net_device` integration.
 
 ## Use Case
 
@@ -94,9 +123,22 @@ The QEMU virtual machine uses two network devices.
                            |                                   |
                            +---------------+-------------------+
                                            |
+                     +---------------------+---------------------+
+                     |                                           |
+                     v                                           v
+             RX hardware addressing                      TX hardware addressing
+             RDBAL / RDBAH / RDLEN                       TDBAL / TDBAH / TDLEN
+             PROGRAMMED + READ BACK                      PROGRAMMED + READ BACK
+                     |                                           |
+                     +---------------------+---------------------+
+                                           |
+                              RX/TX packet engines disabled
+                              RCTL.EN = 0 / TCTL.EN = 0
+                                           |
                                            v
-                                 Hardware ring registers
-                                      NOT YET PROGRAMMED
+                               Head / tail initialization
+                                RDH/RDT + TDH/TDT
+                                    NOT YET DONE
                                            |
                                            v
                                      Packet buffers
@@ -168,6 +210,38 @@ Allocate TX descriptor-ring coherent DMA memory
         +--> 1024 bytes total
         |
         v
+Disable RX/TX packet engines
+        |
+        +--> clear RCTL.EN
+        +--> clear TCTL.EN
+        +--> flush posted writes
+        +--> wait for quiesce
+        |
+        v
+Validate 16-byte DMA base alignment
+        |
+        v
+Program RX ring base / length
+        |
+        +--> RDBAL / RDBAH = RX DMA address
+        +--> RDLEN = 1024 bytes
+        |
+        v
+Program TX ring base / length
+        |
+        +--> TDBAL / TDBAH = TX DMA address
+        +--> TDLEN = 1024 bytes
+        |
+        v
+Read back RX/TX ring registers
+        |
+        +--> reconstructed base == DMA address
+        +--> length == 1024 bytes
+        |
+        v
+Verify RX/TX packet engines remain disabled
+        |
+        v
 Mask / clear stale interrupt causes
         |
         v
@@ -195,12 +269,14 @@ Read / acknowledge ICR
 Validate Link Status Change cause
         |
         v
-PCI/MMIO/DMA/IRQ initialization PASS
+PCI/MMIO/DMA/RING/IRQ initialization PASS
 ```
 
-The current milestone establishes real RX and TX descriptor memory, but the NIC is not yet consuming those rings.
+The current milestone establishes real RX and TX descriptor memory and programs the Intel 82540EM descriptor-ring **base addresses and byte lengths** into the QEMU hardware model.
 
-The driver does **not** yet program the RX/TX descriptor-ring base, length, head, or tail registers, does not map packet buffers, and does not claim packet DMA functionality.
+The driver reconstructs the programmed 64-bit addresses from `RDBAL/RDBAH` and `TDBAL/TDBAH`, reads `RDLEN/TDLEN` back, and fails initialization if the values do not match the DMA allocations and expected 1024-byte ring size.
+
+The driver intentionally does **not** initialize `RDH/RDT/TDH/TDT`, does not map packet buffers, and does not enable the RX or TX packet engines. Therefore this milestone does **not** claim active packet DMA or hardware descriptor consumption.
 
 ## MMIO
 
@@ -214,6 +290,12 @@ Current register access includes:
 
 - `CTRL` — Device Control Register
 - `STATUS` — Device Status Register
+- `RCTL` — Receive Control; `RCTL.EN` is explicitly cleared and verified
+- `TCTL` — Transmit Control; `TCTL.EN` is explicitly cleared and verified
+- `RDBAL` / `RDBAH` — RX descriptor-ring DMA base address
+- `RDLEN` — RX descriptor-ring byte length
+- `TDBAL` / `TDBAH` — TX descriptor-ring DMA base address
+- `TDLEN` — TX descriptor-ring byte length
 - `ICR` — Interrupt Cause Read
 - `ICS` — Interrupt Cause Set
 - `IMS` — Interrupt Mask Set
@@ -228,9 +310,9 @@ iowrite32()
 
 rather than normal memory dereferences.
 
-RX/TX descriptor-ring registers are a future hardware-programming milestone.
+`RDH`, `RDT`, `TDH`, and `TDT` are defined for the upcoming ownership-initialization milestone but are intentionally not written yet.
 
-## DMA and Descriptor-Ring Foundation
+## DMA and Descriptor-Ring Hardware Addressing
 
 DMA = Direct Memory Access.
 
@@ -302,15 +384,22 @@ This milestone establishes:
 - coherent DMA allocation
 - explicit CPU/device address separation
 - independent RX and TX descriptor memory
+- 16-byte descriptor-ring DMA base-alignment validation
+- RX base/length programming through `RDBAL/RDBAH/RDLEN`
+- TX base/length programming through `TDBAL/TDBAH/TDLEN`
+- MMIO readback validation of both programmed base addresses and lengths
+- explicit verification that `RCTL.EN` and `TCTL.EN` remain clear
 - DMA ownership
 - DMA lifetime tracking
 - DMA cleanup
 
 It does **not** yet establish:
 
-- RX/TX ring-register programming
+- RX head/tail initialization through `RDH/RDT`
+- TX head/tail initialization through `TDH/TDT`
 - RX packet-buffer DMA mappings
 - TX packet-buffer DMA mappings
+- RX/TX packet-engine enablement
 - actual packet receive DMA
 - actual packet transmit DMA
 
@@ -329,7 +418,7 @@ Ring size:                  1024 bytes
 
 Compile-time assertions verify that the C structures remain 16 bytes and that the selected ring size satisfies the configured ring-length granularity.
 
-The descriptor definitions are present and compiled into the kernel module, but descriptor contents are not yet connected to packet buffers or handed to hardware.
+The descriptor definitions are present and compiled into the kernel module. Their ring memory is now exposed to the hardware model through the programmed base/length registers, but descriptor contents are not yet connected to packet buffers or handed to the packet engines for processing.
 
 ## Descriptor-Ring Management Logic
 
@@ -368,7 +457,7 @@ consumer
 
 This logic is compiled into the production kernel module and is also tested directly in user space through Unity.
 
-It is **not yet wired to the Intel RX/TX hardware head/tail registers**. That integration is a separate milestone because hardware ownership rules must be introduced deliberately rather than inferred from generic circular-queue behavior.
+It is **not yet wired to the Intel RX/TX hardware head/tail registers**. Base-address and length programming are complete, but `RDH/RDT/TDH/TDT` ownership integration remains a separate milestone because hardware ownership rules must be introduced deliberately rather than inferred from generic circular-queue behavior.
 
 ## Interrupt Handling
 
@@ -493,9 +582,9 @@ driver consumes descriptor
 Linux networking stack
 ```
 
-The RX descriptor format and coherent descriptor-ring memory now exist.
+The RX descriptor format, coherent descriptor-ring memory, and RX base/length register programming now exist and are validated.
 
-The remaining RX datapath—packet buffers, hardware register programming, descriptor ownership transitions, receive completion, and Linux packet delivery—is not yet implemented.
+The remaining RX datapath—`RDH/RDT` initialization, packet buffers, descriptor ownership transitions, RX engine enablement, receive completion, replenishment, and Linux packet delivery—is not yet implemented.
 
 ## Planned Transmit Path
 
@@ -529,9 +618,9 @@ NIC transmits Ethernet frame
 Network
 ```
 
-The TX descriptor format and coherent descriptor-ring memory now exist.
+The TX descriptor format, coherent descriptor-ring memory, and TX base/length register programming now exist and are validated.
 
-The remaining TX datapath—packet mapping, hardware register programming, descriptor submission, completion, and reclamation—is not yet implemented.
+The remaining TX datapath—`TDH/TDT` initialization, packet mapping, descriptor submission, memory ordering before tail notification, TX engine enablement, completion, and reclamation—is not yet implemented.
 
 ## Linux Networking Boundary
 
@@ -592,6 +681,8 @@ linux-pcie-network-driver/
 |       +-- pci-mmio-dma-irq-dmesg.txt
 |       +-- descriptor-ring-integration.txt
 |       +-- descriptor-ring-dmesg.txt
+|       +-- hardware-ring-programming-integration.txt
+|       +-- hardware-ring-programming-dmesg.txt
 |       +-- irq-logic-unit-tests.txt
 |
 +-- tests/
@@ -714,13 +805,20 @@ Current automated validation includes:
 - TX descriptor-ring geometry: 64 descriptors / 1024 bytes
 - TX device-visible DMA address creation
 - RX/TX descriptor-ring DMA initialization
+- RX descriptor-ring base/length programming
+- RX programmed base equals the RX DMA address from the same run
+- RX programmed length equals 1024 bytes
+- TX descriptor-ring base/length programming
+- TX programmed base equals the TX DMA address from the same run
+- TX programmed length equals 1024 bytes
+- RX/TX packet engines remain disabled during ring programming
 - Linux IRQ handler registration
 - e1000 LSC interrupt generation
 - ISR execution
 - expected `ICR=0x00000004`
 - Link Status Change handling
 - interrupt completion validation
-- complete PCI/MMIO/DMA/IRQ initialization
+- complete PCI/MMIO/DMA/RING/IRQ initialization
 - module unload
 - TX descriptor-ring DMA release
 - RX descriptor-ring DMA release
@@ -732,14 +830,14 @@ Current automated validation includes:
 Current result:
 
 ```text
-32 integration checks
-32 passed
+35 integration checks
+35 passed
 0 failed
 ```
 
 ## Current Status
 
-The driver currently implements and validates the PCI/MMIO/interrupt/DMA descriptor-ring foundation against a QEMU-emulated Intel 82540EM (`8086:100e`).
+The driver currently implements and validates PCI/MMIO/interrupt/DMA descriptor-ring addressing against a QEMU-emulated Intel 82540EM (`8086:100e`).
 
 Implemented functionality:
 
@@ -761,6 +859,14 @@ Implemented functionality:
 - separate RX descriptor-ring coherent DMA allocation
 - separate TX descriptor-ring coherent DMA allocation
 - CPU virtual address and DMA address separation
+- 16-byte descriptor-ring DMA alignment validation
+- explicit RX/TX packet-engine disable and quiesce
+- RX ring base programming through `RDBAL/RDBAH`
+- RX ring length programming through `RDLEN`
+- TX ring base programming through `TDBAL/TDBAH`
+- TX ring length programming through `TDLEN`
+- RX/TX descriptor-register readback validation
+- verification that RX/TX packet engines remain disabled
 - DMA ownership and lifetime tracking
 - hardware-independent producer / consumer ring logic
 - ring wraparound / full / empty / used / free accounting
@@ -783,11 +889,12 @@ Implemented functionality:
 
 Not yet implemented:
 
-- RX descriptor-ring register programming
-- TX descriptor-ring register programming
+- RX head/tail initialization through `RDH/RDT`
+- TX head/tail initialization through `TDH/TDT`
 - RX packet-buffer DMA mappings
 - TX packet-buffer DMA mappings
-- hardware RX/TX producer / consumer integration
+- RX/TX packet-engine enablement
+- hardware RX/TX producer / consumer ownership integration
 - packet receive
 - packet transmit
 - Linux `net_device` integration
@@ -812,6 +919,12 @@ RX ring allocation:      1024 bytes
 TX descriptor count:     64
 TX descriptor size:      16 bytes
 TX ring allocation:      1024 bytes
+RDLEN readback:          1024 bytes
+TDLEN readback:          1024 bytes
+RX programmed base:      matched runtime RX DMA address
+TX programmed base:      matched runtime TX DMA address
+RCTL.EN after programming: 0 (driver-validated)
+TCTL.EN after programming: 0 (driver-validated)
 ```
 
 These values are runtime observations, not hard-coded driver assumptions.
@@ -822,15 +935,15 @@ DMA addresses are intentionally not documented as fixed values because they are 
 
 Validation output is committed so implemented claims can be traced to actual test runs.
 
-### Current Descriptor-Ring DMA Milestone
+### Current Hardware Ring Programming Milestone
 
 QEMU integration-test result:
 
-- [`docs/evidence/descriptor-ring-integration.txt`](docs/evidence/descriptor-ring-integration.txt)
+- [`docs/evidence/hardware-ring-programming-integration.txt`](docs/evidence/hardware-ring-programming-integration.txt)
 
 Kernel driver log:
 
-- [`docs/evidence/descriptor-ring-dmesg.txt`](docs/evidence/descriptor-ring-dmesg.txt)
+- [`docs/evidence/hardware-ring-programming-dmesg.txt`](docs/evidence/hardware-ring-programming-dmesg.txt)
 
 Integration-test source:
 
@@ -843,6 +956,13 @@ Ring unit-test source:
 Interrupt unit-test source:
 
 - [`tests/unit/test_irq_logic.c`](tests/unit/test_irq_logic.c)
+
+### Previous Descriptor-Ring DMA Milestone
+
+The earlier descriptor-memory milestone remains available as development-history evidence:
+
+- [`docs/evidence/descriptor-ring-integration.txt`](docs/evidence/descriptor-ring-integration.txt)
+- [`docs/evidence/descriptor-ring-dmesg.txt`](docs/evidence/descriptor-ring-dmesg.txt)
 
 ### Previous PCI/MMIO/DMA/IRQ Milestone
 
@@ -868,9 +988,9 @@ The original PCI/MMIO milestone remains available as development-history evidenc
 
 ## Error Handling and Resource Ownership
 
-Driver initialization acquires hardware and kernel resources in stages.
+Driver initialization acquires resources and programs hardware in explicit stages.
 
-Current acquisition sequence:
+Current initialization sequence:
 
 ```text
 PCI device enable
@@ -897,6 +1017,18 @@ RX descriptor-ring coherent DMA allocation
 TX descriptor-ring coherent DMA allocation
         |
         v
+disable / quiesce RX and TX packet engines
+        |
+        v
+program RX/TX descriptor-ring base addresses and lengths
+        |
+        v
+read back and validate descriptor-ring registers
+        |
+        v
+verify RX/TX packet engines remain disabled
+        |
+        v
 IRQ registration
 ```
 
@@ -906,6 +1038,9 @@ Current remove path:
 
 ```text
 mask device interrupts
+        |
+        v
+disable / quiesce RX and TX packet engines
         |
         v
 free Linux IRQ
@@ -948,8 +1083,16 @@ TX allocation failure
     -> free RX ring
     -> unmap BAR0
 
+ring-programming failure
+    -> keep RX/TX packet engines disabled
+    -> free TX ring
+    -> free RX ring
+    -> unmap BAR0
+
 IRQ registration / later probe failure
+    -> mask device interrupts
     -> free IRQ when registered
+    -> keep RX/TX packet engines disabled
     -> free TX ring
     -> free RX ring
     -> unmap BAR0
@@ -1024,8 +1167,15 @@ Partially initialized devices therefore release only resources that were success
 - [x] ring-logic unit tests
 - [x] coherent RX descriptor-ring memory
 - [x] coherent TX descriptor-ring memory
-- [ ] program RX ring base / length / head / tail registers
-- [ ] program TX ring base / length / head / tail registers
+- [x] validate 16-byte RX/TX DMA base alignment
+- [x] disable and quiesce RX/TX packet engines before ring programming
+- [x] program RX base / length registers (`RDBAL/RDBAH/RDLEN`)
+- [x] validate RX base / length through MMIO readback
+- [x] program TX base / length registers (`TDBAL/TDBAH/TDLEN`)
+- [x] validate TX base / length through MMIO readback
+- [x] verify RX/TX packet engines remain disabled
+- [ ] initialize RX head / tail (`RDH/RDT`)
+- [ ] initialize TX head / tail (`TDH/TDT`)
 - [ ] connect software ring state to hardware ownership
 
 ### Receive
@@ -1070,8 +1220,12 @@ Partially initialized devices therefore release only resources that were success
 - [x] runtime evidence for interrupt milestone
 - [x] runtime evidence for DMA-foundation milestone
 - [x] runtime evidence for descriptor-ring DMA milestone
-- [ ] RX register-programming validation
-- [ ] TX register-programming validation
+- [x] RX base/length register-programming validation
+- [x] TX base/length register-programming validation
+- [x] packet-engine-disabled safety validation
+- [x] runtime evidence for hardware ring-programming milestone
+- [ ] RX head/tail ownership validation
+- [ ] TX head/tail ownership validation
 - [ ] packet RX validation
 - [ ] packet TX validation
 - [ ] bidirectional network traffic
@@ -1096,12 +1250,14 @@ Development and validation currently use:
 - legacy INTx
 - coherent DMA memory
 - Intel legacy RX/TX descriptors
+- RX/TX descriptor-ring base/length MMIO programming
+- descriptor-register readback validation
 - producer / consumer ring logic
 - Unity C test framework
 
 Future milestones add:
 
-- RX/TX ring-register programming
+- RX/TX head/tail ownership initialization
 - packet-buffer DMA mappings
 - Linux `net_device`
 - Linux networking integration
@@ -1126,13 +1282,16 @@ The peripheral itself is emulated.
 
 The Linux driver, kernel APIs, PCI subsystem, DMA API, MMIO APIs, interrupt subsystem, resource ownership, error handling, and cleanup paths are real Linux mechanisms.
 
-The project currently demonstrates real Linux allocation and lifetime management of RX/TX descriptor-ring memory, but it does **not** yet claim that the Intel 82540EM hardware is consuming those rings.
+The project currently demonstrates real Linux allocation and lifetime management of RX/TX descriptor-ring memory plus base-address/length programming into the QEMU Intel 82540EM model with MMIO readback validation.
+
+The packet engines remain deliberately disabled, and the project does **not** yet claim that the Intel 82540EM hardware is consuming descriptors or moving packet data.
 
 The following remain planned and are not yet claimed as implemented:
 
-- RX descriptor-ring register programming
-- TX descriptor-ring register programming
+- RX head/tail initialization through `RDH/RDT`
+- TX head/tail initialization through `TDH/TDT`
 - packet-buffer DMA
+- RX/TX packet-engine enablement
 - hardware descriptor ownership transitions
 - packet receive / transmit
 - Linux networking integration

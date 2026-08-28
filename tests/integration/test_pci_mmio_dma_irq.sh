@@ -21,6 +21,10 @@
 #   - independent RX descriptor-ring DMA allocation
 #   - independent TX descriptor-ring DMA allocation
 #   - RX/TX device-visible DMA address creation
+#   - RX descriptor-ring base/length MMIO programming
+#   - TX descriptor-ring base/length MMIO programming
+#   - descriptor-ring register readback validation
+#   - verification that RX/TX packet engines remain disabled
 #   - legacy INTx interrupt registration
 #   - e1000 interrupt generation through ICS
 #   - interrupt delivery through Linux
@@ -535,7 +539,123 @@ pass "RX/TX descriptor-ring DMA initialization completed"
 
 
 # -----------------------------------------------------------------------------
-# 22. Verify Linux IRQ handler registration
+# 22. Verify RX descriptor-ring hardware programming
+# -----------------------------------------------------------------------------
+#
+# The driver programs RDBAL/RDBAH/RDLEN, reads those registers back, and
+# reports success only if the programmed values match the DMA allocation
+# and expected ring length.
+#
+# This test independently compares the programmed RX base reported by the
+# driver against the RX DMA address captured earlier in this run.
+#
+
+RX_PROGRAMMED_BASE="$(
+    sudo dmesg |
+    sed -n \
+        's/.*sk_e1000: RX descriptor-ring registers programmed base=\(0x[0-9a-fA-F][0-9a-fA-F]*\) length=[0-9][0-9]* bytes.*/\1/p' |
+    tail -n 1
+)"
+
+RX_PROGRAMMED_LENGTH="$(
+    sudo dmesg |
+    sed -n \
+        's/.*sk_e1000: RX descriptor-ring registers programmed base=0x[0-9a-fA-F][0-9a-fA-F]* length=\([0-9][0-9]*\) bytes.*/\1/p' |
+    tail -n 1
+)"
+
+
+if [[ -z "${RX_PROGRAMMED_BASE}" ]]; then
+    fail "RX descriptor-ring hardware-programming log not found"
+fi
+
+
+if [[ "${RX_PROGRAMMED_BASE}" != "${RX_DMA_ADDRESS}" ]]; then
+    fail \
+        "RX programmed base ${RX_PROGRAMMED_BASE} does not match DMA address ${RX_DMA_ADDRESS}"
+fi
+
+
+if [[ "${RX_PROGRAMMED_LENGTH}" != "${EXPECTED_RING_SIZE}" ]]; then
+    fail \
+        "RX programmed length ${RX_PROGRAMMED_LENGTH} does not match expected ${EXPECTED_RING_SIZE}"
+fi
+
+
+pass \
+    "RX hardware ring programming verified (base=${RX_PROGRAMMED_BASE}, length=${RX_PROGRAMMED_LENGTH})"
+
+
+# -----------------------------------------------------------------------------
+# 23. Verify TX descriptor-ring hardware programming
+# -----------------------------------------------------------------------------
+#
+# The driver performs the same write/readback validation for
+# TDBAL/TDBAH/TDLEN. This test confirms that the programmed base corresponds
+# to the TX DMA allocation captured earlier in this run.
+#
+
+TX_PROGRAMMED_BASE="$(
+    sudo dmesg |
+    sed -n \
+        's/.*sk_e1000: TX descriptor-ring registers programmed base=\(0x[0-9a-fA-F][0-9a-fA-F]*\) length=[0-9][0-9]* bytes.*/\1/p' |
+    tail -n 1
+)"
+
+TX_PROGRAMMED_LENGTH="$(
+    sudo dmesg |
+    sed -n \
+        's/.*sk_e1000: TX descriptor-ring registers programmed base=0x[0-9a-fA-F][0-9a-fA-F]* length=\([0-9][0-9]*\) bytes.*/\1/p' |
+    tail -n 1
+)"
+
+
+if [[ -z "${TX_PROGRAMMED_BASE}" ]]; then
+    fail "TX descriptor-ring hardware-programming log not found"
+fi
+
+
+if [[ "${TX_PROGRAMMED_BASE}" != "${TX_DMA_ADDRESS}" ]]; then
+    fail \
+        "TX programmed base ${TX_PROGRAMMED_BASE} does not match DMA address ${TX_DMA_ADDRESS}"
+fi
+
+
+if [[ "${TX_PROGRAMMED_LENGTH}" != "${EXPECTED_RING_SIZE}" ]]; then
+    fail \
+        "TX programmed length ${TX_PROGRAMMED_LENGTH} does not match expected ${EXPECTED_RING_SIZE}"
+fi
+
+
+pass \
+    "TX hardware ring programming verified (base=${TX_PROGRAMMED_BASE}, length=${TX_PROGRAMMED_LENGTH})"
+
+
+# -----------------------------------------------------------------------------
+# 24. Verify RX/TX packet engines remained disabled
+# -----------------------------------------------------------------------------
+#
+# Packet buffers and hardware head/tail ownership are not initialized yet.
+# The driver therefore requires both packet engines to remain disabled while
+# descriptor-ring base addresses and lengths are programmed.
+#
+# sk_e1000_program_descriptor_ring_addressing() verifies RCTL.EN and TCTL.EN
+# after register programming and readback before emitting this success log.
+#
+
+if ! sudo dmesg |
+    grep -q \
+    "sk_e1000: descriptor-ring base/length programming PASSED with RX/TX engines disabled"; then
+
+    fail "descriptor-ring programming safety validation log not found"
+fi
+
+
+pass "RX/TX descriptor-ring programming completed with packet engines disabled"
+
+
+# -----------------------------------------------------------------------------
+# 25. Verify Linux IRQ handler registration
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -554,7 +674,7 @@ pass "Linux IRQ handler registration verified"
 
 
 # -----------------------------------------------------------------------------
-# 23. Verify deterministic hardware interrupt trigger
+# 26. Verify deterministic hardware interrupt trigger
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -568,7 +688,7 @@ pass "e1000 LSC interrupt trigger verified"
 
 
 # -----------------------------------------------------------------------------
-# 24. Verify interrupt reached ISR
+# 27. Verify interrupt reached ISR
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -582,7 +702,7 @@ pass "ISR received expected ICR=0x00000004"
 
 
 # -----------------------------------------------------------------------------
-# 25. Verify Link Status Change handling
+# 28. Verify Link Status Change handling
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -596,7 +716,7 @@ pass "Link Status Change interrupt handled"
 
 
 # -----------------------------------------------------------------------------
-# 26. Verify interrupt synchronization completed
+# 29. Verify interrupt synchronization completed
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -610,22 +730,22 @@ pass "Interrupt delivery validation completed"
 
 
 # -----------------------------------------------------------------------------
-# 27. Verify complete initialization
+# 30. Verify complete initialization
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
     grep -q \
-    "sk_e1000: PCI/MMIO/DMA/IRQ initialization PASSED"; then
+    "sk_e1000: PCI/MMIO/DMA/RING/IRQ initialization PASSED"; then
 
-    fail "complete DMA/IRQ initialization success log not found"
+    fail "complete DMA/RING/IRQ initialization success log not found"
 fi
 
 
-pass "PCI/MMIO/DMA/IRQ initialization completed"
+pass "PCI/MMIO/DMA/RING/IRQ initialization completed"
 
 
 # -----------------------------------------------------------------------------
-# 28. Unload driver and exercise remove()
+# 31. Unload driver and exercise remove()
 # -----------------------------------------------------------------------------
 
 sudo rmmod "${DRIVER_NAME}"
@@ -640,7 +760,7 @@ pass "sk_e1000 module unloaded"
 
 
 # -----------------------------------------------------------------------------
-# 29. Verify TX descriptor-ring DMA release
+# 32. Verify TX descriptor-ring DMA release
 # -----------------------------------------------------------------------------
 #
 # TX was allocated after RX and therefore is released first.
@@ -658,7 +778,7 @@ pass "TX descriptor-ring DMA memory released"
 
 
 # -----------------------------------------------------------------------------
-# 30. Verify RX descriptor-ring DMA release
+# 33. Verify RX descriptor-ring DMA release
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -673,7 +793,7 @@ pass "RX descriptor-ring DMA memory released"
 
 
 # -----------------------------------------------------------------------------
-# 31. Verify complete driver cleanup path
+# 34. Verify complete driver cleanup path
 # -----------------------------------------------------------------------------
 
 if ! sudo dmesg |
@@ -688,7 +808,7 @@ pass "Driver cleanup path verified"
 
 
 # -----------------------------------------------------------------------------
-# 32. Verify IRQ registration was released
+# 35. Verify IRQ registration was released
 # -----------------------------------------------------------------------------
 
 if grep -q "${DRIVER_NAME}" /proc/interrupts; then
@@ -700,7 +820,7 @@ pass "IRQ handler released"
 
 
 # -----------------------------------------------------------------------------
-# 33. Verify custom driver released PCI device
+# 36. Verify custom driver released PCI device
 # -----------------------------------------------------------------------------
 
 if [[ "$(current_driver)" == "${DRIVER_NAME}" ]]; then
@@ -712,7 +832,7 @@ pass "PCI device released by sk_e1000"
 
 
 # -----------------------------------------------------------------------------
-# 34. Verify PCI bus mastering was cleared
+# 37. Verify PCI bus mastering was cleared
 # -----------------------------------------------------------------------------
 #
 # Perform this before the EXIT trap potentially restores the stock e1000

@@ -1,0 +1,5 @@
+sent 60-byte deterministic RX test frame on tap-e1000
+dst=52:54:00:12:34:57
+src=0a:d4:85:ef:53:63
+ethertype=0x88b6
+payload-prefix=SK_E1000_RX_TEST_001

@@ -1,0 +1,28 @@
+[ 9550.349971] sk_e1000: matched PCI device 8086:100e
+[ 9550.350836] sk_e1000: PCI bus mastering enabled
+[ 9550.350839] sk_e1000: DMA addressing configured: 64-bit
+[ 9550.350855] sk_e1000: BAR0 physical start=0xfeb00000
+[ 9550.350855] sk_e1000: BAR0 size=131072 bytes
+[ 9550.350971] sk_e1000: CTRL   = 0x40140240
+[ 9550.350973] sk_e1000: STATUS = 0x80080783
+[ 9550.350973] sk_e1000: PCI/MMIO initialization PASSED
+[ 9550.350976] sk_e1000: RX descriptor ring allocated count=64 size=1024 bytes
+[ 9550.350977] sk_e1000: RX descriptor ring DMA address=0x000000000441c000
+[ 9550.350978] sk_e1000: TX descriptor ring allocated count=64 size=1024 bytes
+[ 9550.350979] sk_e1000: TX descriptor ring DMA address=0x0000000003fc7000
+[ 9550.350979] sk_e1000: RX/TX descriptor-ring DMA allocation PASSED
+[ 9550.362283] sk_e1000: RX descriptor-ring registers programmed base=0x000000000441c000 length=1024 bytes
+[ 9550.362285] sk_e1000: TX descriptor-ring registers programmed base=0x0000000003fc7000 length=1024 bytes
+[ 9550.362286] sk_e1000: descriptor-ring base/length programming PASSED with RX/TX engines disabled
+[ 9550.362368] sk_e1000: IRQ handler registered on IRQ 20
+[ 9550.362383] sk_e1000: triggering LSC interrupt test
+[ 9550.362461] sk_e1000: interrupt received ICR=0x00000004
+[ 9550.362467] sk_e1000: LSC interrupt handled
+[ 9550.362705] sk_e1000: interrupt test PASSED
+[ 9550.374256] sk_e1000: deterministic TX packet mapped length=60 DMA=0x00000000022d6ec0
+[ 9550.374508] sk_e1000: deterministic TX descriptor completed status=0x01 TDH=1 TDT=1
+[ 9550.386228] sk_e1000: deterministic TX packet DMA validation PASSED length=60 bytes
+[ 9550.386232] sk_e1000: PCI/MMIO/DMA/RING/IRQ initialization PASSED
+[ 9550.571555] sk_e1000: TX descriptor ring DMA memory released
+[ 9550.571561] sk_e1000: RX descriptor ring DMA memory released
+[ 9550.571734] sk_e1000: device removed and resources released

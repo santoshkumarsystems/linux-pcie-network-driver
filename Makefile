@@ -58,11 +58,17 @@ obj-m += sk_e1000.o
 #         producer/consumer accounting logic shared with
 #         user-space unit tests.
 #
+#     src/sk_e1000_frame.c
+#         Hardware-independent deterministic Ethernet-frame
+#         construction and RX validation shared by the kernel
+#         and user-space Unity tests.
+#
 sk_e1000-objs := \
 	src/sk_e1000.o \
 	src/sk_e1000_logic.o \
 	src/sk_e1000_dma.o \
-	src/sk_e1000_ring.o
+	src/sk_e1000_ring.o \
+	src/sk_e1000_frame.o
 
 
 #
@@ -77,6 +83,7 @@ sk_e1000-objs := \
 #     #include "sk_e1000_dma.h"
 #     #include "sk_e1000_desc.h"
 #     #include "sk_e1000_ring.h"
+#     #include "sk_e1000_frame.h"
 #
 ccflags-y += -I$(src)/include
 
@@ -109,6 +116,9 @@ PWD := $(shell pwd)
 #     src/sk_e1000_ring.c
 #         producer/consumer ring mathematics
 #
+#     src/sk_e1000_frame.c
+#         deterministic Ethernet-frame construction and validation
+#
 # Linux PCI, MMIO, interrupt, and DMA APIs are intentionally not mocked.
 # Hardware-dependent behavior is validated through QEMU integration tests.
 #
@@ -124,10 +134,12 @@ UNIT_BUILD_DIR := build/tests
 #
 IRQ_TEST_BIN := $(UNIT_BUILD_DIR)/test_irq_logic
 RING_TEST_BIN := $(UNIT_BUILD_DIR)/test_ring_logic
+FRAME_TEST_BIN := $(UNIT_BUILD_DIR)/test_frame_logic
 
 UNIT_TEST_BINS := \
 	$(IRQ_TEST_BIN) \
-	$(RING_TEST_BIN)
+	$(RING_TEST_BIN) \
+	$(FRAME_TEST_BIN)
 
 
 #
@@ -145,6 +157,15 @@ IRQ_TEST_SRCS := \
 RING_TEST_SRCS := \
 	tests/unit/test_ring_logic.c \
 	src/sk_e1000_ring.c \
+	$(UNITY_DIR)/unity.c
+
+
+#
+# Deterministic Ethernet-frame logic unit-test sources.
+#
+FRAME_TEST_SRCS := \
+	tests/unit/test_frame_logic.c \
+	src/sk_e1000_frame.c \
 	$(UNITY_DIR)/unity.c
 
 
@@ -211,6 +232,9 @@ unit-test: unit-test-build
 	@echo
 	@echo "=== RING LOGIC UNIT TESTS ==="
 	./$(RING_TEST_BIN)
+	@echo
+	@echo "=== FRAME LOGIC UNIT TESTS ==="
+	./$(FRAME_TEST_BIN)
 
 
 #
@@ -233,6 +257,14 @@ $(IRQ_TEST_BIN): $(IRQ_TEST_SRCS) include/sk_e1000_logic.h
 $(RING_TEST_BIN): $(RING_TEST_SRCS) include/sk_e1000_ring.h
 	@mkdir -p $(UNIT_BUILD_DIR)
 	$(UNIT_CC) $(UNIT_CFLAGS) $(RING_TEST_SRCS) -o $@
+
+
+#
+# Deterministic Ethernet-frame logic test executable.
+#
+$(FRAME_TEST_BIN): $(FRAME_TEST_SRCS) include/sk_e1000_frame.h
+	@mkdir -p $(UNIT_BUILD_DIR)
+	$(UNIT_CC) $(UNIT_CFLAGS) $(FRAME_TEST_SRCS) -o $@
 
 
 # ============================================================================

@@ -1,0 +1,29 @@
+[ 9573.945263] sk_e1000: matched PCI device 8086:100e
+[ 9573.945995] sk_e1000: PCI bus mastering enabled
+[ 9573.945998] sk_e1000: DMA addressing configured: 64-bit
+[ 9573.946012] sk_e1000: BAR0 physical start=0xfeb00000
+[ 9573.946013] sk_e1000: BAR0 size=131072 bytes
+[ 9573.946051] sk_e1000: CTRL   = 0x40140240
+[ 9573.946053] sk_e1000: STATUS = 0x80080783
+[ 9573.946053] sk_e1000: PCI/MMIO initialization PASSED
+[ 9573.946056] sk_e1000: RX descriptor ring allocated count=64 size=1024 bytes
+[ 9573.946056] sk_e1000: RX descriptor ring DMA address=0x00000000044db000
+[ 9573.946057] sk_e1000: TX descriptor ring allocated count=64 size=1024 bytes
+[ 9573.946057] sk_e1000: TX descriptor ring DMA address=0x00000000044da000
+[ 9573.946058] sk_e1000: RX/TX descriptor-ring DMA allocation PASSED
+[ 9573.957841] sk_e1000: RX descriptor-ring registers programmed base=0x00000000044db000 length=1024 bytes
+[ 9573.957845] sk_e1000: TX descriptor-ring registers programmed base=0x00000000044da000 length=1024 bytes
+[ 9573.957846] sk_e1000: descriptor-ring base/length programming PASSED with RX/TX engines disabled
+[ 9573.957946] sk_e1000: IRQ handler registered on IRQ 20
+[ 9573.957961] sk_e1000: triggering LSC interrupt test
+[ 9573.958067] sk_e1000: interrupt received ICR=0x00000004
+[ 9573.958077] sk_e1000: LSC interrupt handled
+[ 9573.958292] sk_e1000: interrupt test PASSED
+[ 9573.969813] sk_e1000: deterministic TX packet mapped length=60 DMA=0x00000000022d6f00
+[ 9573.969945] sk_e1000: deterministic TX descriptor completed status=0x01 TDH=1 TDT=1
+[ 9573.981741] sk_e1000: deterministic TX packet DMA validation PASSED length=60 bytes
+[ 9573.993902] sk_e1000: deterministic RX buffer mapped size=2048 DMA=0x000000000188b800
+[ 9573.994045] sk_e1000: deterministic RX armed RDH=0 RDT=1 buffer=2048 bytes; waiting up to 15000 ms for external frame
+[ 9575.005789] sk_e1000: deterministic RX descriptor completed status=0x07 length=60 RDH=1 RDT=1
+[ 9575.005806] sk_e1000: deterministic RX packet DMA validation PASSED length=60 bytes
+[ 9575.005808] sk_e1000: PCI/MMIO/DMA/RING/IRQ initialization PASSED
